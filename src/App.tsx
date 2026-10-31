@@ -840,7 +840,7 @@ function executeWestgardAnalysis(
         z_L2: z2 !== null ? Number(z2.toFixed(2)) : null,
         val_L3: v3,
         z_L3: z3 !== null ? Number(z3.toFixed(2)) : null,
-        status: status === "SKIP" ? "PASS" : status,
+        status: status,
         rules_single: singleRules.join(", "),
         rules_cross: crossRules.join(", "),
         cause: "",
