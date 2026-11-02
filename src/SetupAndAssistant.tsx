@@ -11,6 +11,7 @@ import {
   getReagentThreshold75,
   isReagentReached75,
   formatDateVN,
+  getVnIsoDateString,
   rpcCall,
   computeMuAndSigma,
   calculateWeightedPooledCv,
@@ -20,10 +21,11 @@ import {
 } from "./types";
 
 // ============================================================================
-// FILE 2: src/SetupAndAssistant.tsx (FULL ENTERPRISE EDITION - KHÔNG CẮT GIẢM)
+// FILE 2: src/SetupAndAssistant.tsx (V5.6.0 FULL ENTERPRISE EDITION - KHÔNG CẮT GIẢM)
 // 1. Khai báo Hóa chất Mở nắp vs Pha tay + Bảng "Danh mục hóa chất QC" (Sửa/Xóa)
 // 2. Cấu hình Test kế thừa Lot, chọn đơn vị TEa (% / Abs), MU 3 mức & Cờ Ngoại lệ
 // 3. Pooled CV% theo trọng số (n-1) CLSI C24 & Phân luồng Westgard theo Sigma
+// 4. Đồng bộ tức thời lot_history khi đổi Lô & Chống cuộn chuột làm lệch thông số
 // ✦ An intellectual product by Handsome Long ✦
 // ============================================================================
 
@@ -210,6 +212,7 @@ export function getRecommendedWestgardRules(
 
 // ============================================================================
 // HÀM TÍNH POOLED CV% (u_rw) THEO TRỌNG SỐ BẬC TỰ DO (n_i - 1) CHUẨN CLSI C24
+// (HM 16: Bảo vệ không gán khống N=30 cho Lô mới khi N <= 1)
 // ============================================================================
 export function computeThreeLotPooledStats(
   cfg: TestConfig,
@@ -244,32 +247,44 @@ export function computeThreeLotPooledStats(
       itemsForPooled.push({
         lot_number: lot.lot_number,
         cv_pct: lvCv,
-        n_count: lvN && lvN > 1 ? lvN : 30, // Mặc định n = 30 nếu lô cũ không lưu N
+        n_count: lvN !== undefined && lvN !== null ? lvN : 30,
       });
     }
   });
 
+  // HM 16: Chỉ đưa Lô hiện tại vào gộp phương sai nếu đã có từ 2 điểm hợp lệ trở lên (df >= 1),
+  // hoặc nếu chưa có bất kỳ Lô lịch sử nào trước đó thì tạm dùng với df mặc định
   if (currentCvPct > 0) {
-    itemsForPooled.push({
-      lot_number: cfg.lot_number,
-      cv_pct: currentCvPct,
-      n_count: currentValidN && currentValidN > 1 ? currentValidN : 30,
-    });
+    if (currentValidN !== undefined && currentValidN >= 2) {
+      itemsForPooled.push({
+        lot_number: cfg.lot_number,
+        cv_pct: currentCvPct,
+        n_count: currentValidN,
+      });
+    } else if (itemsForPooled.length === 0) {
+      itemsForPooled.push({
+        lot_number: cfg.lot_number,
+        cv_pct: currentCvPct,
+        n_count: 30,
+      });
+    }
   }
 
-  if (itemsForPooled.length === 0) {
+  const weighted = calculateWeightedPooledCv(itemsForPooled);
+
+  if (weighted.totalDf === 0 || weighted.pooledCvPct <= 0) {
     const mfgMean =
       levelKey === "L1"
-        ? cfg.mfg_mean_L1
+        ? cfg.mfg_mean_L1 || cfg.mean_L1
         : levelKey === "L2"
-        ? cfg.mfg_mean_L2
-        : cfg.mfg_mean_L3;
+        ? cfg.mfg_mean_L2 || cfg.mean_L2
+        : cfg.mfg_mean_L3 || cfg.mean_L3;
     const mfgSd =
       levelKey === "L1"
-        ? cfg.mfg_sd_L1
+        ? cfg.mfg_sd_L1 || cfg.sd_L1
         : levelKey === "L2"
-        ? cfg.mfg_sd_L2
-        : cfg.mfg_sd_L3;
+        ? cfg.mfg_sd_L2 || cfg.sd_L2
+        : cfg.mfg_sd_L3 || cfg.sd_L3;
     const fallbackCv = mfgMean > 0 ? (mfgSd / mfgMean) * 100 : 2.5;
     return {
       pooledCvPct: Number(fallbackCv.toFixed(2)),
@@ -279,7 +294,6 @@ export function computeThreeLotPooledStats(
     };
   }
 
-  const weighted = calculateWeightedPooledCv(itemsForPooled);
   const proposedSd = (currentMeanLab * weighted.pooledCvPct) / 100;
 
   return {
@@ -287,6 +301,79 @@ export function computeThreeLotPooledStats(
     proposedSdByCv: Number(proposedSd.toFixed(3)),
     lotsCountUsed: itemsForPooled.length,
     totalDegreesOfFreedom: weighted.totalDf,
+  };
+}
+
+/**
+ * HM 17: Hàm đóng gói thống kê của Lô cũ vào lot_history trước khi đổi sang Số Lô mới
+ * Khớp 100% với hàm archiveOldLotToHistoryIfNeeded trong code.gs V5.6
+ */
+function archiveOldLotOnClientIfChanged(
+  cfg: TestConfig,
+  newLotNumber: string,
+  newExpiryDate: string,
+  archiveDate: string
+): TestConfig {
+  const oldLot = String(cfg.lot_number || "").trim();
+  const nextLot = String(newLotNumber || "").trim();
+
+  if (!oldLot || !nextLot || oldLot.toLowerCase() === nextLot.toLowerCase()) {
+    return {
+      ...cfg,
+      lot_number: nextLot || cfg.lot_number,
+      expiry_date: newExpiryDate || cfg.expiry_date,
+    };
+  }
+
+  const mu1 = computeMuAndSigma(cfg, "L1");
+  const mu2 = computeMuAndSigma(cfg, "L2");
+  const mu3 = computeMuAndSigma(cfg, "L3");
+
+  const hasAnyPoints =
+    mu1.validPointsCount > 0 ||
+    mu2.validPointsCount > 0 ||
+    mu3.validPointsCount > 0 ||
+    mu1.cvPct > 0;
+
+  let nextHistory: LotArchiveItem[] = Array.isArray(cfg.lot_history)
+    ? [...cfg.lot_history]
+    : [];
+
+  if (hasAnyPoints) {
+    const archiveItem: LotArchiveItem = {
+      lot_number: oldLot,
+      expiry_date: cfg.expiry_date,
+      range_source: cfg.range_source,
+      mean_L1: mu1.validPointsCount > 0 ? Number(mu1.meanLab.toFixed(3)) : cfg.mean_L1,
+      sd_L1: mu1.validPointsCount > 1 ? Number(mu1.sdLab.toFixed(3)) : cfg.sd_L1,
+      cv_L1: mu1.cvPct,
+      n_L1: mu1.validPointsCount,
+      mean_L2: mu2.validPointsCount > 0 ? Number(mu2.meanLab.toFixed(3)) : cfg.mean_L2,
+      sd_L2: mu2.validPointsCount > 1 ? Number(mu2.sdLab.toFixed(3)) : cfg.sd_L2,
+      cv_L2: mu2.cvPct,
+      n_L2: mu2.validPointsCount,
+      mean_L3: mu3.validPointsCount > 0 ? Number(mu3.meanLab.toFixed(3)) : cfg.mean_L3,
+      sd_L3: mu3.validPointsCount > 1 ? Number(mu3.sdLab.toFixed(3)) : cfg.sd_L3,
+      cv_L3: mu3.cvPct,
+      n_L3: mu3.validPointsCount,
+      archived_at: archiveDate || getVnIsoDateString(),
+    };
+
+    nextHistory = [
+      archiveItem,
+      ...nextHistory.filter(
+        (item) => item.lot_number.trim().toLowerCase() !== oldLot.toLowerCase()
+      ),
+    ].slice(0, 3);
+  }
+
+  return {
+    ...cfg,
+    lot_number: nextLot,
+    expiry_date: newExpiryDate || cfg.expiry_date,
+    lot_history: nextHistory,
+    accumulated_points: 0,
+    range_active_days: 0,
   };
 }
 
@@ -335,33 +422,37 @@ interface SetupAndAssistantProps {
   apiUrl: string;
   authToken: string;
   currentUser: UserAccount;
-  runDate: string;
+  runDate?: string;
   sections: string[];
   labMachines: { section: string; machine: string }[];
   configs: TestConfig[];
   setConfigs: React.Dispatch<React.SetStateAction<TestConfig[]>>;
   reagents: ReagentLotBM16[];
   setReagents: React.Dispatch<React.SetStateAction<ReagentLotBM16[]>>;
-  users: UserAccount[];
+  users?: UserAccount[];
   initialSubTab?: "SETUP" | "ASSISTANT";
   onSubTabChange?: (tab: "SETUP" | "ASSISTANT") => void;
+  notify?: (msg: string, type?: "success" | "error" | "info") => void;
 }
 
 export default function SetupAndAssistant({
   apiUrl,
   authToken,
   currentUser,
-  runDate,
+  runDate: propRunDate,
   sections,
   labMachines,
   configs,
   setConfigs,
   reagents,
   setReagents,
-  users,
+  users = [],
   initialSubTab,
   onSubTabChange,
 }: SetupAndAssistantProps) {
+  // HM 11: Luôn đảm bảo ngày hiện tại theo chuẩn múi giờ Việt Nam (UTC+7)
+  const runDate = propRunDate || getVnIsoDateString();
+
   // =========================================================================
   // 1. CÁC HÀM TRỢ GIÚP LỌC DỮ LIỆU
   // =========================================================================
@@ -553,7 +644,7 @@ export default function SetupAndAssistant({
   }, [initialSubTab]);
 
   // =========================================================================
-  // XỬ LÝ KHAI BÁO / SỬA / XÓA HÓA CHẤT QC (MỞ NẮP & PHA TAY)
+  // XỬ LÝ KHAI BÁO / SỬA / XÓA HÓA CHẤT QC (MỞ NẮP & PHA TAY - HM 17)
   // =========================================================================
   const handleSaveReagentLot = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -585,7 +676,9 @@ export default function SetupAndAssistant({
       return;
     }
 
-    const verifier = users.find(
+    const accountList =
+      Array.isArray(users) && users.length > 0 ? users : [currentUser];
+    const verifier = accountList.find(
       (u) =>
         (u.id.toLowerCase() === prep_by_id.trim().toLowerCase() ||
           u.name.toLowerCase() === prep_by_id.trim().toLowerCase()) &&
@@ -631,46 +724,19 @@ export default function SetupAndAssistant({
         })
       );
 
-      // Tự động cập nhật Số Lô & lưu trữ Lot cũ vào lot_history (với n_L1/L2/L3 chuẩn)
+      // HM 17: Tự động cập nhật Số Lô & lưu trữ Lot cũ vào lot_history đồng bộ tức thời với code.gs
       setConfigs((prev) =>
         prev.map((c) => {
           if (
             c.machine_name === machine_name &&
             c.control_name === cleanCtrlName
           ) {
-            const isNewLot = c.lot_number !== cleanLot;
-            const prevArchive: LotArchiveItem[] = Array.isArray(c.lot_history)
-              ? [...c.lot_history]
-              : [];
-            if (isNewLot && c.lot_number) {
-              const mu1 = computeMuAndSigma(c, "L1");
-              const mu2 = computeMuAndSigma(c, "L2");
-              const mu3 = computeMuAndSigma(c, "L3");
-              prevArchive.unshift({
-                lot_number: c.lot_number,
-                expiry_date: c.expiry_date,
-                range_source: c.range_source,
-                mean_L1: c.mean_L1,
-                sd_L1: c.sd_L1,
-                cv_L1: mu1.cvPct,
-                n_L1: mu1.validPointsCount > 1 ? mu1.validPointsCount : 30,
-                mean_L2: c.mean_L2,
-                sd_L2: c.sd_L2,
-                cv_L2: mu2.cvPct,
-                n_L2: mu2.validPointsCount > 1 ? mu2.validPointsCount : 30,
-                mean_L3: c.mean_L3,
-                sd_L3: c.sd_L3,
-                cv_L3: mu3.cvPct,
-                n_L3: mu3.validPointsCount > 1 ? mu3.validPointsCount : 30,
-                archived_at: runDate,
-              });
-            }
-            return {
-              ...c,
-              lot_number: cleanLot,
+            return archiveOldLotOnClientIfChanged(
+              c,
+              cleanLot,
               expiry_date,
-              lot_history: prevArchive.slice(0, 3),
-            };
+              runDate
+            );
           }
           return c;
         })
@@ -713,10 +779,12 @@ export default function SetupAndAssistant({
     };
 
     setReagents((prev) => [...prev, newLot]);
+
+    // HM 17: Kể cả khi tạo bản ghi Hóa chất mới nối tiếp cho cùng tên Control, vẫn tự động cất Lô cũ vào lot_history
     setConfigs((prev) =>
       prev.map((c) =>
         c.machine_name === machine_name && c.control_name === cleanCtrlName
-          ? { ...c, lot_number: cleanLot, expiry_date }
+          ? archiveOldLotOnClientIfChanged(c, cleanLot, expiry_date, runDate)
           : c
       )
     );
@@ -917,9 +985,15 @@ export default function SetupAndAssistant({
       setConfigs((prev) =>
         prev.map((c) => {
           if (c.test_id !== editingTestId) return c;
-          const isStillMfgRange = c.range_source === "MANUFACTURER";
+          const archivedBase = archiveOldLotOnClientIfChanged(
+            c,
+            inheritedLot,
+            inheritedExpiry,
+            runDate
+          );
+          const isStillMfgRange = archivedBase.range_source === "MANUFACTURER";
           const nextObj: TestConfig = {
-            ...c,
+            ...archivedBase,
             section: setupSection,
             machine_name: setupMachine,
             control_name: setupControl,
@@ -939,12 +1013,12 @@ export default function SetupAndAssistant({
             mfg_sd_L2: s2,
             mfg_mean_L3: m3,
             mfg_sd_L3: s3,
-            mean_L1: isStillMfgRange ? m1 : c.mean_L1,
-            sd_L1: isStillMfgRange ? s1 : c.sd_L1,
-            mean_L2: isStillMfgRange ? m2 : c.mean_L2,
-            sd_L2: isStillMfgRange ? s2 : c.sd_L2,
-            mean_L3: isStillMfgRange ? m3 : c.mean_L3,
-            sd_L3: isStillMfgRange ? s3 : c.sd_L3,
+            mean_L1: isStillMfgRange ? m1 : archivedBase.mean_L1,
+            sd_L1: isStillMfgRange ? s1 : archivedBase.sd_L1,
+            mean_L2: isStillMfgRange ? m2 : archivedBase.mean_L2,
+            sd_L2: isStillMfgRange ? s2 : archivedBase.sd_L2,
+            mean_L3: isStillMfgRange ? m3 : archivedBase.mean_L3,
+            sd_L3: isStillMfgRange ? s3 : archivedBase.sd_L3,
             expected_qual_L1: newTestForm.expected_qual_L1,
             expected_qual_L2: newTestForm.expected_qual_L2,
             expected_qual_L3: newTestForm.expected_qual_L3,
@@ -1099,6 +1173,23 @@ export default function SetupAndAssistant({
             : c
         )
       );
+      await rpcCall(
+        apiUrl,
+        "apply_lab_range",
+        {
+          test_id: testObj.test_id,
+          range_source: "MANUFACTURER",
+          applied_date: runDate,
+          mean_L1: testObj.mfg_mean_L1,
+          sd_L1: testObj.mfg_sd_L1,
+          mean_L2: testObj.mfg_mean_L2,
+          sd_L2: testObj.mfg_sd_L2,
+          mean_L3: testObj.mfg_mean_L3,
+          sd_L3: testObj.mfg_sd_L3,
+          lot_history: testObj.lot_history || [],
+        },
+        authToken
+      );
       return;
     }
 
@@ -1178,12 +1269,14 @@ export default function SetupAndAssistant({
       archived_at: runDate,
     };
 
+    const otherLots = (testObj.lot_history || []).filter(
+      (h) => h.lot_number !== testObj.lot_number
+    );
+    const updatedLotHistory = [archiveEntry, ...otherLots].slice(0, 3);
+
     setConfigs((prev) =>
       prev.map((c) => {
         if (c.test_id !== testObj.test_id) return c;
-        const otherLots = (c.lot_history || []).filter(
-          (h) => h.lot_number !== testObj.lot_number
-        );
         return {
           ...c,
           mean_L1: nextM1,
@@ -1195,11 +1288,12 @@ export default function SetupAndAssistant({
           range_source: sourceType,
           range_applied_date: runDate,
           range_active_days: 1,
-          lot_history: [archiveEntry, ...otherLots].slice(0, 3),
+          lot_history: updatedLotHistory,
         };
       })
     );
 
+    // HM 17: Gửi kèm updatedLotHistory xuống code.gs để đồng bộ vĩnh viễn trên Google Sheets
     await rpcCall(
       apiUrl,
       "apply_lab_range",
@@ -1213,6 +1307,7 @@ export default function SetupAndAssistant({
         sd_L2: nextS2,
         mean_L3: nextM3,
         sd_L3: nextS3,
+        lot_history: updatedLotHistory,
       },
       authToken
     );
@@ -1343,6 +1438,7 @@ export default function SetupAndAssistant({
               <input
                 type="number"
                 step="any"
+                onWheel={(e) => e.currentTarget.blur()}
                 placeholder="VD: 8.0 (Trống = tự lấy CV%)"
                 value={draft.verif_cvr}
                 onChange={(e) => updateDraft({ verif_cvr: e.target.value })}
@@ -1356,6 +1452,7 @@ export default function SetupAndAssistant({
               <input
                 type="number"
                 step="any"
+                onWheel={(e) => e.currentTarget.blur()}
                 placeholder="VD: 1.11 (Ưu tiên giữ số này)"
                 value={draft.verif_bias}
                 onChange={(e) => updateDraft({ verif_bias: e.target.value })}
@@ -1375,6 +1472,7 @@ export default function SetupAndAssistant({
                 <input
                   type="number"
                   step="any"
+                  onWheel={(e) => e.currentTarget.blur()}
                   placeholder="Trống = tự lấy CV%"
                   value={draft.urw_pooled}
                   onChange={(e) => updateDraft({ urw_pooled: e.target.value })}
@@ -1388,6 +1486,7 @@ export default function SetupAndAssistant({
                 <input
                   type="number"
                   step="any"
+                  onWheel={(e) => e.currentTarget.blur()}
                   placeholder="VD: 0.45 (Ưu tiên EQA)"
                   value={draft.ubias_periodic}
                   onChange={(e) =>
@@ -1403,6 +1502,7 @@ export default function SetupAndAssistant({
                 <input
                   type="number"
                   step="any"
+                  onWheel={(e) => e.currentTarget.blur()}
                   placeholder="VD: 1.5"
                   value={draft.uc_cal}
                   onChange={(e) => updateDraft({ uc_cal: e.target.value })}
@@ -1443,6 +1543,7 @@ export default function SetupAndAssistant({
             <input
               type="number"
               step="any"
+              onWheel={(e) => e.currentTarget.blur()}
               placeholder="VD: 15.83"
               value={draft.manual_mu}
               onChange={(e) => updateDraft({ manual_mu: e.target.value })}
@@ -1783,6 +1884,7 @@ export default function SetupAndAssistant({
                         type="number"
                         min={1}
                         required
+                        onWheel={(e) => e.currentTarget.blur()}
                         value={reagentForm.quantity_prepared}
                         onChange={(e) =>
                           setReagentForm({
@@ -2142,6 +2244,7 @@ export default function SetupAndAssistant({
                             type="number"
                             step="any"
                             required
+                            onWheel={(e) => e.currentTarget.blur()}
                             placeholder="Mean L1"
                             value={newTestForm.mean_L1}
                             onChange={(e) =>
@@ -2156,6 +2259,7 @@ export default function SetupAndAssistant({
                             type="number"
                             step="any"
                             required
+                            onWheel={(e) => e.currentTarget.blur()}
                             placeholder="SD L1"
                             value={newTestForm.sd_L1}
                             onChange={(e) =>
@@ -2179,6 +2283,7 @@ export default function SetupAndAssistant({
                               type="number"
                               step="any"
                               required
+                              onWheel={(e) => e.currentTarget.blur()}
                               placeholder="Mean L2"
                               value={newTestForm.mean_L2}
                               onChange={(e) =>
@@ -2193,6 +2298,7 @@ export default function SetupAndAssistant({
                               type="number"
                               step="any"
                               required
+                              onWheel={(e) => e.currentTarget.blur()}
                               placeholder="SD L2"
                               value={newTestForm.sd_L2}
                               onChange={(e) =>
@@ -2217,6 +2323,7 @@ export default function SetupAndAssistant({
                               type="number"
                               step="any"
                               required
+                              onWheel={(e) => e.currentTarget.blur()}
                               placeholder="Mean L3"
                               value={newTestForm.mean_L3}
                               onChange={(e) =>
@@ -2231,6 +2338,7 @@ export default function SetupAndAssistant({
                               type="number"
                               step="any"
                               required
+                              onWheel={(e) => e.currentTarget.blur()}
                               placeholder="SD L3"
                               value={newTestForm.sd_L3}
                               onChange={(e) =>
@@ -2326,6 +2434,7 @@ export default function SetupAndAssistant({
                         <input
                           type="number"
                           step="any"
+                          onWheel={(e) => e.currentTarget.blur()}
                           placeholder="VD: 15"
                           value={newTestForm.tea}
                           onChange={(e) =>
@@ -2483,7 +2592,8 @@ export default function SetupAndAssistant({
                 <p className="text-xs text-slate-500">
                   Quản lý toàn bộ thông tin hóa chất mở nắp và hóa chất pha tay.
                   Khi bạn chỉnh sửa Số Lô hoặc Hạn dùng tại đây, các xét nghiệm
-                  đi kèm sẽ tự động cập nhật theo.
+                  đi kèm sẽ tự động lưu trữ Lô cũ vào lịch sử 3 Lô và cập nhật
+                  theo.
                 </p>
               </div>
 
@@ -2814,10 +2924,10 @@ export default function SetupAndAssistant({
                           <span className="font-mono font-bold text-slate-700">
                             L1: {t.mfg_mean_L1}±{t.mfg_sd_L1}
                             {t.levels_count >= 2
-                              ? ` | L2: ${t.mfg_mean_L2}±${t.mfg_sd_L2}`
+                              ? ` | L2: ${t.mfg_mean_L2}±{t.mfg_sd_L2}`
                               : ""}
                             {t.levels_count === 3
-                              ? ` | L3: ${t.mfg_mean_L3}±${t.mfg_sd_L3}`
+                              ? ` | L3: ${t.mfg_mean_L3}±{t.mfg_sd_L3}`
                               : ""}
                           </span>
                         </div>
@@ -2853,7 +2963,7 @@ export default function SetupAndAssistant({
                                         {lot.lot_number}
                                       </b>{" "}
                                       (N=
-                                      {lot.n_L1 || 30})
+                                      {lot.n_L1 ?? 30})
                                     </span>
                                     <span className="text-slate-500">
                                       Lưu: {formatDateVN(lot.archived_at)}
