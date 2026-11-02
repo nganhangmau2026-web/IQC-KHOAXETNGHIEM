@@ -14,10 +14,11 @@ import {
 } from "./types";
 
 // ============================================================================
-// FILE 3: src/ChartsAndReports.tsx (FULL ENTERPRISE EDITION - KHÔNG CẮT GIẢM)
+// FILE 3: src/ChartsAndReports.tsx (V5.6.0 FULL ENTERPRISE EDITION - KHÔNG CẮT GIẢM)
 // 1. Đồ thị L-J: Màn hình hiện đủ 4 chú giải & viền kép; Bản in hiện 3 chú giải & điểm chuẩn
 // 2. Bản in L-J 1 trang A4 Ngang (scale 0.86) + Phiếu ĐKBĐĐ đa mức (BM.01.XN.QTQL.30)
 // 3. Sổ Nội kiểm (BM.09) & Sổ Pha chế Hóa chất (BM.16 - Chỉ lọc hóa chất pha tay)
+// 4. Tự động sắp xếp chuỗi thời gian tăng dần khi có điểm nhập bù ngày cũ (HM 12)
 // ✦ An intellectual product by Handsome Long ✦
 // ============================================================================
 
@@ -62,6 +63,25 @@ const Ic = {
   ),
 };
 
+/**
+ * HM 12: Sắp xếp mảng lịch sử L-J theo đúng thứ tự thời gian (isoDate + time + is_rerun)
+ * Đảm bảo khi nhập bù kết quả ngày cũ, trục hoành biểu đồ L-J và bảng in không bị đảo lộn
+ */
+function sortHistoryChronologically(
+  arr: HistoryPoint[] | undefined
+): HistoryPoint[] {
+  if (!Array.isArray(arr)) return [];
+  return [...arr].sort((a, b) => {
+    const da = String(a.isoDate || "");
+    const db = String(b.isoDate || "");
+    if (da !== db) return da < db ? -1 : 1;
+    const ta = String(a.time || "").replace("h", ":");
+    const tb = String(b.time || "").replace("h", ":");
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    return (a.is_rerun ? 1 : 0) - (b.is_rerun ? 1 : 0);
+  });
+}
+
 // ============================================================================
 // COMPONENT 1: BIỂU ĐỒ LEVEY-JENNINGS 3D (TÁCH BIỆT UI MÀN HÌNH & BẢN IN)
 // ============================================================================
@@ -99,8 +119,8 @@ export function Luminous3DLJChart({
   isPrintView = false,
 }: Luminous3DLJChartProps) {
   const filterHistory = (arr: HistoryPoint[] | undefined) => {
-    if (!Array.isArray(arr)) return [];
-    let filtered = arr.filter((p) => {
+    const sorted = sortHistoryChronologically(arr);
+    let filtered = sorted.filter((p) => {
       if (
         filterMode === "BY_LOT" &&
         lotFilter !== "ALL" &&
@@ -824,7 +844,7 @@ export default function IsoReports({
       ? computeMuAndSigma(activeLjTest, "L3")
       : null;
 
-  // Lấy tối đa 32 điểm để chia đều thành 2 cột (có hỗ trợ lọc bỏ điểm FAIL nếu được tick)
+  // HM 12: Lấy tối đa 32 điểm đã sắp xếp đúng thứ tự thời gian để chia đều thành 2 cột
   const getPrintTablePoints = (): HistoryPoint[] => {
     if (!activeLjTest) return [];
     const effectiveLevel =
@@ -837,7 +857,7 @@ export default function IsoReports({
         : effectiveLevel === "L2"
         ? activeLjTest.history_L2
         : activeLjTest.history_L3 || [];
-    return rawArr
+    return sortHistoryChronologically(rawArr)
       .filter((p) => {
         if (p.isoDate < ljPrintFrom || p.isoDate > ljPrintTo) return false;
         if (hideResolvedFailsInPrint && p.status === "FAIL") return false;
