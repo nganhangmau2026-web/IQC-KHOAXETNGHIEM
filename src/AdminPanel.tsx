@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import {
   UserAccount,
   UserRole,
@@ -14,13 +14,17 @@ import {
   INITIAL_REAGENTS,
   INITIAL_CONFIGS,
   INITIAL_BM09_LOGS,
+  usePersistentState,
+  AiSystemConfig,
+  DEFAULT_AI_CONFIG,
 } from "./types";
 
 // ============================================================================
-// FILE 4: src/AdminPanel.tsx (FULL ENTERPRISE EDITION - KHÔNG CẮT GIẢM)
+// FILE 4: src/AdminPanel.tsx (V5.6.0 FULL ENTERPRISE EDITION - KHÔNG CẮT GIẢM)
 // 1. Cửa sổ 2 cột Quản lý Xét nghiệm Ngoại lệ (Không xét quy tắc 6x, 8x, 10x)
 // 2. Giao diện Spring Pastel & Ma trận Cấp/Tước 8 Quyền Quản trị trực tiếp
 // 3. Công cụ 1-Click: Nạp lại Dữ liệu mẫu chuẩn HOẶC Xóa trắng để vận hành thật
+// 4. Tích hợp Cấu hình Khóa Gemini AI Dùng Chung Toàn Khoa (Đồng bộ PC & Mobile)
 // ✦ An intellectual product by Handsome Long ✦
 // ============================================================================
 
@@ -200,7 +204,7 @@ function matchesDefaultExemptCode(testName: string): boolean {
   );
 }
 
-interface AdminPanelProps {
+export interface AdminPanelProps {
   apiUrl: string;
   setApiUrl: (url: string) => void;
   authToken: string;
@@ -217,6 +221,9 @@ interface AdminPanelProps {
   setConfigs?: React.Dispatch<React.SetStateAction<TestConfig[]>>;
   setReagents?: React.Dispatch<React.SetStateAction<ReagentLotBM16[]>>;
   setBm09Logs?: React.Dispatch<React.SetStateAction<BM09LogEntry[]>>;
+  aiConfig?: AiSystemConfig;
+  setAiConfig?: React.Dispatch<React.SetStateAction<AiSystemConfig>>;
+  currentUser?: UserAccount;
 }
 
 export default function AdminPanel({
@@ -234,9 +241,44 @@ export default function AdminPanel({
   setConfigs,
   setReagents,
   setBm09Logs,
+  aiConfig: externalAiConfig,
+  setAiConfig: setExternalAiConfig,
+  currentUser,
 }: AdminPanelProps) {
   const [tempApiUrl, setTempApiUrl] = useState(apiUrl);
   const [urlSavedMsg, setUrlSavedMsg] = useState(false);
+
+  // --- STATE CẤU HÌNH GEMINI AI TOÀN KHOA (DÙNG CHUNG CHO MỌI ĐIỆN THOẠI & PC) ---
+  const [internalAiConfig, setInternalAiConfig] =
+    usePersistentState<AiSystemConfig>(
+      STORAGE_KEYS.AI_CONFIG,
+      DEFAULT_AI_CONFIG
+    );
+  const activeAiConfig = externalAiConfig || internalAiConfig;
+
+  const [tempGeminiKey, setTempGeminiKey] = useState<string>(
+    activeAiConfig.gemini_api_key || ""
+  );
+  const [tempAiModel, setTempAiModel] = useState<string>(
+    activeAiConfig.ai_model || "gemini-2.5-flash"
+  );
+  const [showApiKey, setShowApiKey] = useState<boolean>(false);
+  const [isSavingAi, setIsSavingAi] = useState<boolean>(false);
+  const [isTestingAi, setIsTestingAi] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (activeAiConfig) {
+      setTempGeminiKey(activeAiConfig.gemini_api_key || "");
+      setTempAiModel(activeAiConfig.ai_model || "gemini-2.5-flash");
+    }
+  }, [activeAiConfig]);
+
+  const updateBothAiConfigs = (nextCfg: AiSystemConfig) => {
+    setInternalAiConfig(nextCfg);
+    if (setExternalAiConfig) {
+      setExternalAiConfig(nextCfg);
+    }
+  };
 
   // --- STATE BỘ LỌC & HIỂN THỊ MA TRẬN PHÂN QUYỀN NHÂN SỰ ---
   const [userSearch, setUserSearch] = useState("");
@@ -273,11 +315,11 @@ export default function AdminPanel({
     setActionToast(msg);
     window.setTimeout(() => {
       setActionToast((prev) => (prev === msg ? null : prev));
-    }, 3400);
+    }, 3600);
   };
 
   // =========================================================================
-  // 1. CÔNG CỤ QUẢN TRỊ DỮ LIỆU 1 CHẠM (KHÔNG CẦN MỞ F12 CONSOLE)
+  // 1. CÔNG CỤ QUẢN TRỊ DỮ LIỆU 1 CHẠM & CẤU HÌNH KHÓA GEMINI AI TOÀN KHOA
   // =========================================================================
   const handleReloadSeedData = () => {
     if (
@@ -322,6 +364,98 @@ export default function AdminPanel({
     );
   };
 
+  const handleSaveAiConfig = async () => {
+    const cleanKey = tempGeminiKey.trim();
+    const cleanModel = tempAiModel.trim() || "gemini-2.5-flash";
+    const nextCfg: AiSystemConfig = {
+      gemini_api_key: cleanKey,
+      ai_model: cleanModel,
+      updated_by: currentUser?.name || "ADMIN",
+      updated_at: new Date().toISOString(),
+    };
+
+    setIsSavingAi(true);
+    updateBothAiConfigs(nextCfg);
+
+    const res = await rpcCall(
+      apiUrl,
+      "admin_save_ai_config",
+      {
+        gemini_api_key: cleanKey,
+        ai_model: cleanModel,
+        updated_by: currentUser?.name || "ADMIN",
+      },
+      authToken
+    );
+    setIsSavingAi(false);
+
+    if (res.net && res.body?.status === "success") {
+      triggerToast(
+        "Đã lưu Khóa Gemini AI lên Google Sheets! Mọi Điện thoại & Máy tính trong Khoa đã có thể quét ảnh QC."
+      );
+    } else {
+      triggerToast(
+        "Đã lưu Khóa Gemini AI trên trình duyệt này (Chờ đồng bộ lên Google Sheets)."
+      );
+    }
+  };
+
+  const handleTestAiConnection = async () => {
+    const cleanKey = tempGeminiKey.trim();
+    const cleanModel = tempAiModel.trim() || "gemini-2.5-flash";
+    if (!cleanKey) {
+      window.alert("Vui lòng dán mã Gemini API Key trước khi bấm Kiểm tra!");
+      return;
+    }
+
+    setIsTestingAi(true);
+    try {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+        cleanModel
+      )}:generateContent?key=${encodeURIComponent(cleanKey)}`;
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: 'Trả về đúng chuỗi JSON: {"status":"OK","engine":"MEDLAB_IQC_AI"}',
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0,
+            responseMimeType: "application/json",
+          },
+        }),
+      });
+
+      if (response.ok) {
+        triggerToast(
+          `Kết nối thành công với mô hình ${cleanModel}! Sẵn sàng quét ảnh QC trên Điện thoại & PC.`
+        );
+      } else {
+        const errText = await response.text();
+        window.alert(
+          `Khóa API hoặc Model trả về lỗi (${response.status}): ${errText.slice(
+            0,
+            150
+          )}`
+        );
+      }
+    } catch {
+      triggerToast(
+        "Trình duyệt sẽ tự động dùng cổng Proxy trên Google Apps Script khi quét ảnh!"
+      );
+    } finally {
+      setIsTestingAi(false);
+    }
+  };
+
   // =========================================================================
   // 2. XỬ LÝ CỬA SỔ CÁC TEST NGOẠI LỆ (KHÔNG XÉT QUY TẮC 6x, 8x, 10x)
   // =========================================================================
@@ -347,19 +481,23 @@ export default function AdminPanel({
 
   const handleAutoDetectDefaultExemptTests = () => {
     if (!setConfigs) return;
-    let countMatched = 0;
+    const matchedList: TestConfig[] = [];
     setConfigs((prev) =>
       prev.map((c) => {
         if (matchesDefaultExemptCode(c.test_name)) {
-          countMatched++;
-          return { ...c, is_exempt_long_rules: true };
+          const nextObj = { ...c, is_exempt_long_rules: true };
+          matchedList.push(nextObj);
+          return nextObj;
         }
         return c;
       })
     );
+    matchedList.forEach((cfg) => {
+      rpcCall(apiUrl, "save_config", cfg, authToken);
+    });
     triggerToast(
-      countMatched > 0
-        ? `Đã tự động đưa ${countMatched} xét nghiệm thuộc nhóm (WBC, RBC, HGB, HCT, PLT) vào Cửa sổ Ngoại lệ!`
+      matchedList.length > 0
+        ? `Đã tự động đưa ${matchedList.length} xét nghiệm thuộc nhóm (WBC, RBC, HGB, HCT, PLT) vào Cửa sổ Ngoại lệ!`
         : "Hiện chưa có xét nghiệm nào trùng tên WBC, RBC, HGB, HCT, PLT trong danh mục."
     );
   };
@@ -576,6 +714,18 @@ export default function AdminPanel({
     setLabMachines((prev) =>
       prev.map((m) => (m.section === oldSec ? { ...m, section: trimmed } : m))
     );
+    if (setConfigs) {
+      setConfigs((prev) =>
+        prev.map((c) => (c.section === oldSec ? { ...c, section: trimmed } : c))
+      );
+    }
+    if (setReagents) {
+      setReagents((prev) =>
+        prev.map((r) =>
+          r.section_name === oldSec ? { ...r, section_name: trimmed } : r
+        )
+      );
+    }
     triggerToast(`Đã đổi tên Lab "${oldSec}" thành "${trimmed}".`);
     await rpcCall(
       apiUrl,
@@ -635,6 +785,20 @@ export default function AdminPanel({
           : m
       )
     );
+    if (setConfigs) {
+      setConfigs((prev) =>
+        prev.map((c) =>
+          c.machine_name === oldMac ? { ...c, machine_name: trimmed } : c
+        )
+      );
+    }
+    if (setReagents) {
+      setReagents((prev) =>
+        prev.map((r) =>
+          r.machine_name === oldMac ? { ...r, machine_name: trimmed } : r
+        )
+      );
+    }
     triggerToast(`Đã đổi tên thiết bị "${oldMac}" thành "${trimmed}".`);
     await rpcCall(
       apiUrl,
@@ -862,6 +1026,110 @@ export default function AdminPanel({
               className="flex-1 px-3.5 py-2.5 rounded-2xl bg-gradient-to-r from-rose-600 to-orange-600 hover:brightness-105 text-white font-black text-xs shadow-sm transition text-center"
             >
               🗑️ Xóa Trắng Để Nhập Thật
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* ===================================================================== */}
+      {/* KHỐI 1.5 (ADD-ON V5.6): KHÓA GEMINI AI DÙNG CHUNG TOÀN KHOA            */}
+      {/* ===================================================================== */}
+      <div className="bg-gradient-to-r from-indigo-50/80 via-white to-amber-50/80 border-2 border-indigo-200 rounded-3xl p-5 shadow-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <div>
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-indigo-600 text-white">
+              Zero-Config Mobile AI Vision
+            </span>
+            <h3 className="text-sm font-black text-indigo-950 uppercase mt-1">
+              🤖 Cấu Hình Khóa Gemini AI Dùng Chung Toàn Khoa (Quét Ảnh QC Điện
+              Thoại ↔ Máy Tính)
+            </h3>
+            <p className="text-xs text-slate-600">
+              Bạn chỉ cần dán mã Gemini API Key 1 lần tại đây và bấm{" "}
+              <b>Lưu & Đồng Bộ</b>. Toàn bộ Điện thoại của KTV khi đăng nhập sẽ
+              tự động nhận được khóa AI từ Google Sheets mà không cần cài đặt
+              lại trên điện thoại.
+            </p>
+          </div>
+
+          <span
+            className={`px-3 py-1 rounded-full text-xs font-black border ${
+              activeAiConfig.gemini_api_key
+                ? "bg-emerald-50 text-emerald-700 border-emerald-300"
+                : "bg-amber-100 text-amber-800 border-amber-300"
+            }`}
+          >
+            {activeAiConfig.gemini_api_key
+              ? "✓ Đã kích hoạt AI Toàn Khoa"
+              : "Chưa cấu hình API Key"}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end text-xs">
+          <div className="md:col-span-5">
+            <label className="font-bold text-slate-700 block mb-1">
+              Mã khóa Google Gemini API Key (Lấy từ Google AI Studio):
+            </label>
+            <div className="relative">
+              <input
+                type={showApiKey ? "text" : "password"}
+                value={tempGeminiKey}
+                onChange={(e) => setTempGeminiKey(e.target.value)}
+                placeholder="AIzaSy..."
+                className="w-full bg-white border border-indigo-300 rounded-2xl pl-3.5 pr-14 py-2 font-mono font-bold text-slate-800 outline-none focus:border-indigo-600"
+              />
+              <button
+                type="button"
+                onClick={() => setShowApiKey(!showApiKey)}
+                className="absolute right-2 top-1/2 -translate-y-1/2 px-2 py-0.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[10.5px]"
+              >
+                {showApiKey ? "Ẩn" : "Hiện"}
+              </button>
+            </div>
+          </div>
+
+          <div className="md:col-span-3">
+            <label className="font-bold text-slate-700 block mb-1">
+              Mô hình nhận diện ảnh QC:
+            </label>
+            <select
+              value={tempAiModel}
+              onChange={(e) => setTempAiModel(e.target.value)}
+              className="w-full bg-white border border-indigo-300 rounded-2xl px-3 py-2 font-bold text-indigo-950 outline-none"
+            >
+              <option value="gemini-2.5-flash">
+                gemini-2.5-flash (Khuyên dùng)
+              </option>
+              <option value="gemini-2.0-flash">
+                gemini-2.0-flash (Siêu tốc)
+              </option>
+              <option value="gemini-1.5-flash">
+                gemini-1.5-flash (Ổn định)
+              </option>
+              <option value="gemini-2.5-pro">
+                gemini-2.5-pro (Chuyên sâu)
+              </option>
+            </select>
+          </div>
+
+          <div className="md:col-span-4 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleSaveAiConfig}
+              disabled={isSavingAi}
+              className="flex-1 py-2 px-3.5 rounded-2xl bg-gradient-to-r from-indigo-600 to-blue-600 hover:brightness-105 text-white font-black shadow-sm transition whitespace-nowrap disabled:opacity-50"
+            >
+              {isSavingAi
+                ? "⏳ Đang lưu..."
+                : "💾 Lưu & Đồng Bộ Toàn Khoa"}
+            </button>
+            <button
+              type="button"
+              onClick={handleTestAiConnection}
+              disabled={isTestingAi}
+              className="py-2 px-3.5 rounded-2xl bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 font-black transition whitespace-nowrap disabled:opacity-50"
+            >
+              {isTestingAi ? "⏳ Đang thử..." : "⚡ Test Key"}
             </button>
           </div>
         </div>
