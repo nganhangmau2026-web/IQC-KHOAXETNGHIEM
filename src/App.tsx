@@ -14,6 +14,7 @@ import {
   EvalRow,
   BM09LogEntry,
   formatDateVN,
+  getVnIsoDateString,
   getReagentThreshold75,
   isReagentReached75,
   formatSDPositionBadge,
@@ -23,16 +24,22 @@ import {
   INITIAL_REAGENTS,
   INITIAL_CONFIGS,
   INITIAL_BM09_LOGS,
+  AiSystemConfig,
+  DEFAULT_AI_CONFIG,
+  MobileDraftIndexItem,
+  MobileDraftPayload,
+  compressImageDual,
+  analyzeQcImageWithAI,
 } from "./types";
 import SetupAndAssistant from "./SetupAndAssistant";
 import IsoReports, { Luminous3DLJChart } from "./ChartsAndReports";
 import AdminPanel from "./AdminPanel";
 
 // ============================================================================
-// FILE 5: src/App.tsx (FULL ENTERPRISE EDITION - ĐỒNG BỘ 100% QUY TRÌNH 30 & 31)
-// - Phân luồng tự động Westgard Sigma (>=6.0: 1-3s | 5.0-5.99: 1-3s/2-2s/R-4s | <5.0: Đầy đủ)
-// - Liên thông Cửa sổ Test Ngoại lệ (Tự động bỏ qua 6x, 8x, 10x khi is_exempt_long_rules = true)
-// - Tự động khóa cứng Mức bị lỗi trong Modal khắc phục & Đẩy điểm is_rerun lên L-J / Dashboard
+// FILE 5: src/App.tsx (V5.6.0 FULL ENTERPRISE EDITION - ĐỒNG BỘ 100% QUY TRÌNH 30 & 31)
+// - Khôi phục nguyên bản 100% OrioBrandLogo, chữ vàng ánh kim, 7 Tabs & Dashboard 4 Thẻ
+// - Phân luồng tự động Westgard Sigma theo từng mức L1/L2/L3 & Miễn trừ Ngoại lệ 6x/8x/10x
+// - Tích hợp Quét ảnh AI Vision, Liên thông Điện thoại <-> PC & Hàng đợi Offline Sync
 // ✦ An intellectual product by Handsome Long ✦
 // ============================================================================
 
@@ -343,19 +350,80 @@ const Ic = {
   ),
 };
 
+/**
+ * HM 12: Sắp xếp mảng lịch sử L-J theo thứ tự thời gian (isoDate + time + is_rerun)
+ */
+function sortHistoryPoints(arr: HistoryPoint[] | undefined): HistoryPoint[] {
+  if (!Array.isArray(arr)) return [];
+  return [...arr].sort((a, b) => {
+    const da = String(a.isoDate || "");
+    const db = String(b.isoDate || "");
+    if (da !== db) return da < db ? -1 : 1;
+    const ta = String(a.time || "").replace("h", ":");
+    const tb = String(b.time || "").replace("h", ":");
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    return (a.is_rerun ? 1 : 0) - (b.is_rerun ? 1 : 0);
+  });
+}
+
+/**
+ * HM 03 & HM 14: Làm sạch chuỗi Z-score lịch sử trước khi xét quy tắc nhiều điểm (2-2s, 4-1s, 6x, 8x, 10x)
+ * - Dùng điểm chạy lại đạt (is_rerun) thay thế cho điểm FAIL cùng ngày (HM 03).
+ * - Ngắt chuỗi tích lũy sau các điểm FAIL đã bị bác bỏ ở những ngày trước (HM 14).
+ */
+function buildCleanWestgardZSeries(
+  historyArr: HistoryPoint[] | undefined,
+  currentLot: string,
+  upToIsoDate?: string
+): number[] {
+  const sorted = sortHistoryPoints(historyArr).filter(
+    (p) =>
+      p.lot_number === currentLot && (!upToIsoDate || p.isoDate <= upToIsoDate)
+  );
+
+  const effectivePts: HistoryPoint[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    const pt = sorted[i];
+    if (
+      pt.is_rerun &&
+      effectivePts.length > 0 &&
+      effectivePts[effectivePts.length - 1].isoDate === pt.isoDate &&
+      effectivePts[effectivePts.length - 1].status === "FAIL"
+    ) {
+      effectivePts[effectivePts.length - 1] = pt;
+    } else {
+      effectivePts.push(pt);
+    }
+  }
+
+  const cleanZs: number[] = [];
+  for (let i = 0; i < effectivePts.length; i++) {
+    const pt = effectivePts[i];
+    if (pt.status === "FAIL") {
+      cleanZs.length = 0;
+    } else if (typeof pt.z === "number" && !isNaN(pt.z)) {
+      cleanZs.push(pt.z);
+    }
+  }
+  return cleanZs;
+}
+
 // --- HÀM KIỂM TRA CÁC QUY TẮC CHUỖI DÀI HẠN (4-1s, 6x, 8x, 10x) ---
 function checkSequentialLongRules(
   currentZ: number,
   historyArr: HistoryPoint[] | undefined,
   currentLot: string,
   levelLabel: string,
-  isExemptLongRules: boolean
+  isExemptLongRules: boolean,
+  upToIsoDate?: string
 ): string[] {
   const triggered: string[] = [];
-  const validSameLot = (historyArr || []).filter(
-    (p) => p.lot_number === currentLot && p.status !== "FAIL"
+  const prevCleanZs = buildCleanWestgardZSeries(
+    historyArr,
+    currentLot,
+    upToIsoDate
   );
-  const seqZ = [...validSameLot.map((p) => p.z), currentZ];
+  const seqZ = [...prevCleanZs, currentZ];
 
   // Quy tắc 4-1s: 4 điểm liên tiếp cùng vượt +1SD hoặc cùng vượt -1SD
   if (seqZ.length >= 4) {
@@ -396,7 +464,7 @@ function checkSequentialLongRules(
 }
 
 // ============================================================================
-// BỘ MÁY PHÂN TÍCH WESTGARD ĐA MỨC (PHÂN LUỒNG SIGMA & MIỄN TRỪ NGOẠI LỆ)
+// BỘ MÁY PHÂN TÍCH WESTGARD ĐA MỨC V5.6 (SIGMA TỪNG MỨC & MIỄN TRỪ NGOẠI LỆ)
 // ============================================================================
 function executeWestgardAnalysis(
   mode: "NORMAL" | "SIGMA",
@@ -419,26 +487,99 @@ function executeWestgardAnalysis(
   setBm09Logs: React.Dispatch<React.SetStateAction<BM09LogEntry[]>>,
   setWestgardReport: React.Dispatch<
     React.SetStateAction<Record<string, EvalRow[]>>
-  >
+  >,
+  onEnqueueOfflineBatch?: (batchPayload: Record<string, any>) => void,
+  onAfterSuccessSave?: () => void
 ) {
+  const tests = configs
+    .filter(
+      (c) => c.machine_name === selMachine && c.control_name === selControl
+    )
+    .sort((a, b) => a.order - b.order);
+
+  // HM 06: Kiểm tra trước các lỗi nhập số <= 0 hoặc Sai số thô |Z| >= 10SD (quên dấu chấm thập phân)
+  const nonPositiveNames: string[] = [];
+  const extremeOutliers: string[] = [];
+
+  tests.forEach((t) => {
+    if (t.test_type === "QUALITATIVE") return;
+    const r1 = (savedValues[t.test_id]?.L1 ?? "").trim().replace(/,/g, ".");
+    const r2 = (savedValues[t.test_id]?.L2 ?? "").trim().replace(/,/g, ".");
+    const r3 = (savedValues[t.test_id]?.L3 ?? "").trim().replace(/,/g, ".");
+
+    const v1 = r1 !== "" ? parseFloat(r1) : null;
+    const v2 = r2 !== "" ? parseFloat(r2) : null;
+    const v3 = r3 !== "" ? parseFloat(r3) : null;
+
+    if (
+      (v1 !== null && !isNaN(v1) && v1 <= 0) ||
+      (v2 !== null && !isNaN(v2) && v2 <= 0) ||
+      (v3 !== null && !isNaN(v3) && v3 <= 0)
+    ) {
+      nonPositiveNames.push(t.test_name);
+    }
+
+    if (v1 !== null && !isNaN(v1) && t.sd_L1 > 0) {
+      const z1 = (v1 - t.mean_L1) / t.sd_L1;
+      if (Math.abs(z1) >= 10) {
+        extremeOutliers.push(
+          `${t.test_name} (L1: ${v1} -> ${z1.toFixed(1)}SD)`
+        );
+      }
+    }
+    if (v2 !== null && !isNaN(v2) && t.sd_L2 > 0) {
+      const z2 = (v2 - t.mean_L2) / t.sd_L2;
+      if (Math.abs(z2) >= 10) {
+        extremeOutliers.push(
+          `${t.test_name} (L2: ${v2} -> ${z2.toFixed(1)}SD)`
+        );
+      }
+    }
+    if (v3 !== null && !isNaN(v3) && t.sd_L3 > 0) {
+      const z3 = (v3 - t.mean_L3) / t.sd_L3;
+      if (Math.abs(z3) >= 10) {
+        extremeOutliers.push(
+          `${t.test_name} (L3: ${v3} -> ${z3.toFixed(1)}SD)`
+        );
+      }
+    }
+  });
+
+  if (nonPositiveNames.length > 0) {
+    window.alert(
+      `⚠️ Giá trị QC định lượng không thể ≤ 0 tại xét nghiệm: ${nonPositiveNames.join(
+        ", "
+      )}. Vui lòng kiểm tra lại!`
+    );
+    return;
+  }
+
+  if (extremeOutliers.length > 0) {
+    const okOutlier = window.confirm(
+      `🚨 CẢNH BÁO SAI SỐ THÔ (|Z| ≥ 10 SD):\n\n` +
+        extremeOutliers.map((x) => `• ${x}`).join("\n") +
+        `\n\nCó thể đã xảy ra nhầm dấu chấm thập phân (VD: gõ 148 thay vì 14.8). Bạn có chắc chắn muốn tiếp tục phân tích và lưu không?`
+    );
+    if (!okOutlier) return;
+  }
+
   setLastWestgardMode(mode);
   setIsAnalyzing(true);
 
   setTimeout(async () => {
-    const tests = configs
-      .filter(
-        (c) => c.machine_name === selMachine && c.control_name === selControl
-      )
-      .sort((a, b) => a.order - b.order);
     const rows: EvalRow[] = [];
-    const newBM09Entries: BM09LogEntry[] = [];
+    const newBM09Entries: (BM09LogEntry & {
+      lvl1_status?: string;
+      lvl2_status?: string;
+      lvl3_status?: string;
+    })[] = [];
     const shortDate = runDate.slice(8, 10) + "/" + runDate.slice(5, 7);
     const formattedTime = liveTime.slice(0, 2) + "h" + liveTime.slice(3, 5);
 
     tests.forEach((t) => {
-      const r1 = savedValues[t.test_id]?.L1;
-      const r2 = savedValues[t.test_id]?.L2;
-      const r3 = savedValues[t.test_id]?.L3;
+      const r1 = (savedValues[t.test_id]?.L1 ?? "").trim().replace(/,/g, ".");
+      const r2 = (savedValues[t.test_id]?.L2 ?? "").trim().replace(/,/g, ".");
+      const r3 = (savedValues[t.test_id]?.L3 ?? "").trim().replace(/,/g, ".");
 
       if (t.test_type === "QUALITATIVE") {
         const q1 = r1 || t.expected_qual_L1 || "ÂM TÍNH";
@@ -520,6 +661,11 @@ function executeWestgardAnalysis(
           qual_L2: q2,
           qual_L3: q3,
           status: allPass ? "PASS" : "FAIL",
+          lvl1_status: pass1 ? "PASS" : "FAIL",
+          lvl2_status:
+            t.levels_count >= 2 ? (pass2 ? "PASS" : "FAIL") : undefined,
+          lvl3_status:
+            t.levels_count === 3 ? (pass3 ? "PASS" : "FAIL") : undefined,
           rules_single: allPass
             ? ""
             : `Sai lệch chứng Định tính (${failedLvls.join(", ")})`,
@@ -566,8 +712,20 @@ function executeWestgardAnalysis(
       const z2 = v2 !== null && t.sd_L2 > 0 ? (v2 - t.mean_L2) / t.sd_L2 : null;
       const z3 = v3 !== null && t.sd_L3 > 0 ? (v3 - t.mean_L3) / t.sd_L3 : null;
 
-      const muStat = computeMuAndSigma(t, "L1");
-      const sigmaVal = muStat.sigma ?? 4.5;
+      // HM 01: Tính Sigma riêng cho từng mức L1, L2, L3 và lấy Min-Sigma cho quy tắc liên mức
+      const sigmaL1 = computeMuAndSigma(t, "L1").sigma ?? 4.5;
+      const sigmaL2 =
+        t.levels_count >= 2 ? computeMuAndSigma(t, "L2").sigma ?? 4.5 : 4.5;
+      const sigmaL3 =
+        t.levels_count === 3 ? computeMuAndSigma(t, "L3").sigma ?? 4.5 : 4.5;
+
+      const activeSigmas: number[] = [];
+      if (z1 !== null) activeSigmas.push(sigmaL1);
+      if (z2 !== null) activeSigmas.push(sigmaL2);
+      if (z3 !== null) activeSigmas.push(sigmaL3);
+      const minActiveSigma =
+        activeSigmas.length > 0 ? Math.min(...activeSigmas) : 4.5;
+
       const isExemptLong = Boolean(t.is_exempt_long_rules);
 
       const singleRules: string[] = [];
@@ -605,10 +763,9 @@ function executeWestgardAnalysis(
           "Dừng trả kết quả. Kiểm tra bọt khí, kim hút, chuẩn lại và kiểm tra lại.";
       }
 
-      // 2. BỘ 3 QUY TẮC (1-3s / 2-2s / R-4s): ÁP DỤNG KHI MODE = NORMAL HOẶC SIGMA < 6.0
-      const enableThreeRules = mode === "NORMAL" || sigmaVal < 6.0;
-
-      if (enableThreeRules) {
+      // 2. QUY TẮC LIÊN MỨC (2-2s chéo & R-4s): Áp dụng khi MODE = NORMAL hoặc minActiveSigma < 6.0
+      const enableCrossRules = mode === "NORMAL" || minActiveSigma < 6.0;
+      if (enableCrossRules) {
         const activeLevels: {
           key: "L1" | "L2" | "L3";
           z: number;
@@ -643,7 +800,6 @@ function executeWestgardAnalysis(
           });
         }
 
-        // Bảo vệ an toàn: Chỉ xét quy tắc chéo khi có từ 2 mức trở lên
         if (activeLevels.length >= 2) {
           if (activeLevels.length === 3) {
             const allPos2 = activeLevels.every((item) => item.z >= 2);
@@ -672,7 +828,11 @@ function executeWestgardAnalysis(
                 fix = `Hai mức ${a.key} và ${b.key} lệch cùng chiều >2SD. Hiệu chuẩn (Calib) lại.`;
               }
 
-              if (Math.abs(a.z - b.z) >= 4) {
+              // R-4s chuẩn Westgard: 1 mức >= +2SD và 1 mức <= -2SD (chênh lệch >= 4SD ngược chiều)
+              if (
+                Math.abs(a.z - b.z) >= 4 &&
+                ((a.z >= 2 && b.z <= -2) || (a.z <= -2 && b.z >= 2))
+              ) {
                 const r4sLabel = `R-4s (${a.key} và ${b.key})`;
                 if (!crossRules.includes(r4sLabel)) crossRules.push(r4sLabel);
                 a.markFail();
@@ -684,100 +844,116 @@ function executeWestgardAnalysis(
             }
           }
         }
-
-        const prevZ1 = t.history_L1[t.history_L1.length - 1]?.z ?? 0;
-        const prevZ2 = t.history_L2[t.history_L2.length - 1]?.z ?? 0;
-        const prevZ3 = t.history_L3?.[t.history_L3.length - 1]?.z ?? 0;
-
-        if (
-          z1 !== null &&
-          ((z1 >= 2 && prevZ1 >= 2) || (z1 <= -2 && prevZ1 <= -2))
-        ) {
-          singleRules.push("2-2s Liên tiếp (Mức 1)");
-          lvl1Status = "FAIL";
-          status = "FAIL";
-          errType = "Sai số Hệ thống (SE)";
-          fix =
-            "Mức 1 vượt 2SD cùng chiều 2 lần liên tiếp. Cần hiệu chuẩn lại.";
-        }
-        if (
-          z2 !== null &&
-          ((z2 >= 2 && prevZ2 >= 2) || (z2 <= -2 && prevZ2 <= -2))
-        ) {
-          singleRules.push("2-2s Liên tiếp (Mức 2)");
-          lvl2Status = "FAIL";
-          status = "FAIL";
-          errType = "Sai số Hệ thống (SE)";
-          fix =
-            "Mức 2 vượt 2SD cùng chiều 2 lần liên tiếp. Cần hiệu chuẩn lại.";
-        }
-        if (
-          z3 !== null &&
-          ((z3 >= 2 && prevZ3 >= 2) || (z3 <= -2 && prevZ3 <= -2))
-        ) {
-          singleRules.push("2-2s Liên tiếp (Mức 3)");
-          lvl3Status = "FAIL";
-          status = "FAIL";
-          errType = "Sai số Hệ thống (SE)";
-          fix =
-            "Mức 3 vượt 2SD cùng chiều 2 lần liên tiếp. Cần hiệu chuẩn lại.";
-        }
       }
 
-      // 3. BỘ QUY TẮC ĐẦY ĐỦ (4-1s, 6x, 8x, 10x): ÁP DỤNG KHI MODE = NORMAL HOẶC SIGMA < 5.0
-      // (Tự động bỏ qua 6x, 8x, 10x nếu xét nghiệm nằm trong Cửa sổ Test Ngoại lệ)
-      const enableFullLongRules = mode === "NORMAL" || sigmaVal < 5.0;
-      if (enableFullLongRules) {
-        if (z1 !== null) {
-          const seq1 = checkSequentialLongRules(
-            z1,
-            t.history_L1,
-            t.lot_number,
-            "Mức 1",
-            isExemptLong
-          );
-          if (seq1.length > 0) {
-            singleRules.push(...seq1);
-            lvl1Status = "FAIL";
-            status = "FAIL";
-            errType = "Sai số Hệ thống kéo dài (SE)";
-            fix =
-              "Chuỗi điểm QC lệch cùng một phía đường Mean. Cần kiểm tra đường chuẩn (Calib).";
-          }
+      // 2b. QUY TẮC 2-2s LIÊN TIẾP CÙNG MỨC (Dùng chuỗi sạch HM 03/14 & Sigma riêng từng mức HM 01)
+      const cleanZ1 = buildCleanWestgardZSeries(
+        t.history_L1,
+        t.lot_number,
+        runDate
+      );
+      const cleanZ2 = buildCleanWestgardZSeries(
+        t.history_L2,
+        t.lot_number,
+        runDate
+      );
+      const cleanZ3 = buildCleanWestgardZSeries(
+        t.history_L3,
+        t.lot_number,
+        runDate
+      );
+
+      const prevZ1 = cleanZ1.length > 0 ? cleanZ1[cleanZ1.length - 1] : 0;
+      const prevZ2 = cleanZ2.length > 0 ? cleanZ2[cleanZ2.length - 1] : 0;
+      const prevZ3 = cleanZ3.length > 0 ? cleanZ3[cleanZ3.length - 1] : 0;
+
+      if (
+        (mode === "NORMAL" || sigmaL1 < 6.0) &&
+        z1 !== null &&
+        ((z1 >= 2 && prevZ1 >= 2) || (z1 <= -2 && prevZ1 <= -2))
+      ) {
+        singleRules.push("2-2s Liên tiếp (Mức 1)");
+        lvl1Status = "FAIL";
+        status = "FAIL";
+        errType = "Sai số Hệ thống (SE)";
+        fix = "Mức 1 vượt 2SD cùng chiều 2 lần liên tiếp. Cần hiệu chuẩn lại.";
+      }
+      if (
+        (mode === "NORMAL" || sigmaL2 < 6.0) &&
+        z2 !== null &&
+        ((z2 >= 2 && prevZ2 >= 2) || (z2 <= -2 && prevZ2 <= -2))
+      ) {
+        singleRules.push("2-2s Liên tiếp (Mức 2)");
+        lvl2Status = "FAIL";
+        status = "FAIL";
+        errType = "Sai số Hệ thống (SE)";
+        fix = "Mức 2 vượt 2SD cùng chiều 2 lần liên tiếp. Cần hiệu chuẩn lại.";
+      }
+      if (
+        (mode === "NORMAL" || sigmaL3 < 6.0) &&
+        z3 !== null &&
+        ((z3 >= 2 && prevZ3 >= 2) || (z3 <= -2 && prevZ3 <= -2))
+      ) {
+        singleRules.push("2-2s Liên tiếp (Mức 3)");
+        lvl3Status = "FAIL";
+        status = "FAIL";
+        errType = "Sai số Hệ thống (SE)";
+        fix = "Mức 3 vượt 2SD cùng chiều 2 lần liên tiếp. Cần hiệu chuẩn lại.";
+      }
+
+      // 3. BỘ QUY TẮC ĐẦY ĐỦ (4-1s, 6x, 8x, 10x): Áp dụng độc lập theo Sigma từng mức (< 5.0)
+      if (z1 !== null && (mode === "NORMAL" || sigmaL1 < 5.0)) {
+        const seq1 = checkSequentialLongRules(
+          z1,
+          t.history_L1,
+          t.lot_number,
+          "Mức 1",
+          isExemptLong,
+          runDate
+        );
+        if (seq1.length > 0) {
+          singleRules.push(...seq1);
+          lvl1Status = "FAIL";
+          status = "FAIL";
+          errType = "Sai số Hệ thống kéo dài (SE)";
+          fix =
+            "Chuỗi điểm QC lệch cùng một phía đường Mean. Cần kiểm tra đường chuẩn (Calib).";
         }
-        if (z2 !== null) {
-          const seq2 = checkSequentialLongRules(
-            z2,
-            t.history_L2,
-            t.lot_number,
-            "Mức 2",
-            isExemptLong
-          );
-          if (seq2.length > 0) {
-            singleRules.push(...seq2);
-            lvl2Status = "FAIL";
-            status = "FAIL";
-            errType = "Sai số Hệ thống kéo dài (SE)";
-            fix =
-              "Chuỗi điểm QC lệch cùng một phía đường Mean. Cần kiểm tra đường chuẩn (Calib).";
-          }
+      }
+      if (z2 !== null && (mode === "NORMAL" || sigmaL2 < 5.0)) {
+        const seq2 = checkSequentialLongRules(
+          z2,
+          t.history_L2,
+          t.lot_number,
+          "Mức 2",
+          isExemptLong,
+          runDate
+        );
+        if (seq2.length > 0) {
+          singleRules.push(...seq2);
+          lvl2Status = "FAIL";
+          status = "FAIL";
+          errType = "Sai số Hệ thống kéo dài (SE)";
+          fix =
+            "Chuỗi điểm QC lệch cùng một phía đường Mean. Cần kiểm tra đường chuẩn (Calib).";
         }
-        if (z3 !== null) {
-          const seq3 = checkSequentialLongRules(
-            z3,
-            t.history_L3,
-            t.lot_number,
-            "Mức 3",
-            isExemptLong
-          );
-          if (seq3.length > 0) {
-            singleRules.push(...seq3);
-            lvl3Status = "FAIL";
-            status = "FAIL";
-            errType = "Sai số Hệ thống kéo dài (SE)";
-            fix =
-              "Chuỗi điểm QC lệch cùng một phía đường Mean. Cần kiểm tra đường chuẩn (Calib).";
-          }
+      }
+      if (z3 !== null && (mode === "NORMAL" || sigmaL3 < 5.0)) {
+        const seq3 = checkSequentialLongRules(
+          z3,
+          t.history_L3,
+          t.lot_number,
+          "Mức 3",
+          isExemptLong,
+          runDate
+        );
+        if (seq3.length > 0) {
+          singleRules.push(...seq3);
+          lvl3Status = "FAIL";
+          status = "FAIL";
+          errType = "Sai số Hệ thống kéo dài (SE)";
+          fix =
+            "Chuỗi điểm QC lệch cùng một phía đường Mean. Cần kiểm tra đường chuẩn (Calib).";
         }
       }
 
@@ -841,6 +1017,9 @@ function executeWestgardAnalysis(
         val_L3: v3,
         z_L3: z3 !== null ? Number(z3.toFixed(2)) : null,
         status: status,
+        lvl1_status: lvl1Status === "SKIP" ? undefined : lvl1Status,
+        lvl2_status: lvl2Status === "SKIP" ? undefined : lvl2Status,
+        lvl3_status: lvl3Status === "SKIP" ? undefined : lvl3Status,
         rules_single: singleRules.join(", "),
         rules_cross: crossRules.join(", "),
         cause: "",
@@ -863,7 +1042,7 @@ function executeWestgardAnalysis(
 
         const nextL1: HistoryPoint[] =
           found.valL1 !== null && found.zL1 !== null
-            ? [
+            ? sortHistoryPoints([
                 ...c.history_L1,
                 {
                   isoDate: runDate,
@@ -877,12 +1056,12 @@ function executeWestgardAnalysis(
                   status:
                     found.lvl1Status === "SKIP" ? "PASS" : found.lvl1Status,
                 },
-              ]
+              ])
             : c.history_L1;
 
         const nextL2: HistoryPoint[] =
           found.valL2 !== null && found.zL2 !== null
-            ? [
+            ? sortHistoryPoints([
                 ...c.history_L2,
                 {
                   isoDate: runDate,
@@ -896,12 +1075,12 @@ function executeWestgardAnalysis(
                   status:
                     found.lvl2Status === "SKIP" ? "PASS" : found.lvl2Status,
                 },
-              ]
+              ])
             : c.history_L2;
 
         const nextL3: HistoryPoint[] =
           found.valL3 !== null && found.zL3 !== null
-            ? [
+            ? sortHistoryPoints([
                 ...(c.history_L3 || []),
                 {
                   isoDate: runDate,
@@ -915,7 +1094,7 @@ function executeWestgardAnalysis(
                   status:
                     found.lvl3Status === "SKIP" ? "PASS" : found.lvl3Status,
                 },
-              ]
+              ])
             : c.history_L3 || [];
 
         return {
@@ -932,25 +1111,28 @@ function executeWestgardAnalysis(
       })
     );
 
-    setReagents((prev) => {
-      const copy = [...prev];
-      for (let i = copy.length - 1; i >= 0; i--) {
-        if (
-          copy[i].machine_name === selMachine &&
-          copy[i].control_name === selControl
-        ) {
-          const curMap = { ...(copy[i].used_days_map || {}) };
-          curMap[runDate] = (Number(curMap[runDate]) || 0) + useTimesIncrement;
-          copy[i] = {
-            ...copy[i],
-            usage_count: Number(copy[i].usage_count || 0) + useTimesIncrement,
-            used_days_map: curMap,
-          };
-          break;
+    if (useTimesIncrement > 0) {
+      setReagents((prev) => {
+        const copy = [...prev];
+        for (let i = copy.length - 1; i >= 0; i--) {
+          if (
+            copy[i].machine_name === selMachine &&
+            copy[i].control_name === selControl
+          ) {
+            const curMap = { ...(copy[i].used_days_map || {}) };
+            curMap[runDate] =
+              (Number(curMap[runDate]) || 0) + useTimesIncrement;
+            copy[i] = {
+              ...copy[i],
+              usage_count: Number(copy[i].usage_count || 0) + useTimesIncrement,
+              used_days_map: curMap,
+            };
+            break;
+          }
         }
-      }
-      return copy;
-    });
+        return copy;
+      });
+    }
 
     setBm09Logs((prev) => [...newBM09Entries, ...prev]);
     setWestgardReport((prev) => ({
@@ -959,23 +1141,25 @@ function executeWestgardAnalysis(
     }));
     setIsAnalyzing(false);
 
-    await rpcCall(
-      apiUrl,
-      "save_batch",
-      {
-        section: selSection,
-        section_epoch: sectionEpoch,
-        run_date: runDate,
-        run_time: formattedTime,
-        machine_name: selMachine,
-        control_name: selControl,
-        westgard_mode: mode,
-        operator_name: currentUser.name,
-        use_times_increment: useTimesIncrement,
-        items: newBM09Entries,
-      },
-      authToken
-    );
+    const batchPayload = {
+      section: selSection,
+      section_epoch: sectionEpoch,
+      run_date: runDate,
+      run_time: formattedTime,
+      machine_name: selMachine,
+      control_name: selControl,
+      westgard_mode: mode,
+      operator_name: currentUser.name,
+      use_times_increment: useTimesIncrement,
+      items: newBM09Entries,
+    };
+
+    const res = await rpcCall(apiUrl, "save_batch", batchPayload, authToken);
+    if (!res.net || res.body?.status !== "success") {
+      if (onEnqueueOfflineBatch) onEnqueueOfflineBatch(batchPayload);
+    } else if (onAfterSuccessSave) {
+      onAfterSuccessSave();
+    }
   }, 400);
 }
 
@@ -1025,12 +1209,13 @@ function detectViolatedLevelsFromLog(
 }
 
 // ============================================================================
-// COMPONENT Ô NHẬP LIỆU ĐỘC LẬP TRONG GRID MODE (CHỐNG GIẬT LAG 60FPS)
+// COMPONENT Ô NHẬP LIỆU ĐỘC LẬP TRONG GRID MODE (CHỐNG GIẬT LAG 60FPS + AI GLOW)
 // ============================================================================
 const GridLevelCell = React.memo(function GridLevelCell({
   test,
   lvl,
   initialValue,
+  isAiFilled,
   inputRefCallback,
   onNavigateRow,
   onCommitValue,
@@ -1038,6 +1223,7 @@ const GridLevelCell = React.memo(function GridLevelCell({
   test: TestConfig;
   lvl: "L1" | "L2" | "L3";
   initialValue: string;
+  isAiFilled?: boolean;
   inputRefCallback: (el: HTMLInputElement | null) => void;
   onNavigateRow: (delta: number) => void;
   onCommitValue: (testId: string, lvl: "L1" | "L2" | "L3", val: string) => void;
@@ -1094,24 +1280,33 @@ const GridLevelCell = React.memo(function GridLevelCell({
     );
   }
 
-  const num = localVal !== "" ? parseFloat(localVal) : null;
+  const cleanStr = localVal.trim().replace(/,/g, ".");
+  const num = cleanStr !== "" ? parseFloat(cleanStr) : null;
   const z = num !== null && !isNaN(num) && sd > 0 ? (num - mean) / sd : null;
   const absZ = z !== null ? Math.abs(z) : null;
-  const borderCls =
-    absZ === null
-      ? "border-slate-300 bg-slate-50"
-      : absZ >= 3
-      ? "border-rose-500 bg-rose-50 text-rose-900"
-      : absZ >= 2
-      ? "border-amber-500 bg-amber-50 text-amber-900"
-      : "border-emerald-500 bg-emerald-50/50 text-emerald-950";
+  const borderCls = isAiFilled
+    ? "border-amber-500 ring-2 ring-amber-400/70 bg-amber-50/70 text-slate-900"
+    : absZ === null
+    ? "border-slate-300 bg-slate-50"
+    : absZ >= 3
+    ? "border-rose-500 bg-rose-50 text-rose-900"
+    : absZ >= 2
+    ? "border-amber-500 bg-amber-50 text-amber-900"
+    : "border-emerald-500 bg-emerald-50/50 text-emerald-950";
 
   return (
     <td className="py-2 px-3 text-right whitespace-nowrap">
       <div className="inline-flex items-center justify-end gap-2">
         <div className="text-right">
-          <div className="text-[10.5px] font-mono font-bold text-slate-500">
-            {mean} ± {sd}
+          <div className="text-[10.5px] font-mono font-bold text-slate-500 flex items-center justify-end gap-1">
+            {isAiFilled && (
+              <span className="px-1 py-0.2 rounded bg-amber-300 text-amber-950 font-sans font-black text-[9px]">
+                ✨ AI
+              </span>
+            )}
+            <span>
+              {mean} ± {sd}
+            </span>
           </div>
           {z !== null && (
             <div
@@ -1130,12 +1325,13 @@ const GridLevelCell = React.memo(function GridLevelCell({
         </div>
         <input
           ref={inputRefCallback}
-          type="number"
-          step="any"
+          type="text"
+          inputMode="decimal"
+          onWheel={(e) => e.currentTarget.blur()}
           value={localVal}
           placeholder={lvl}
           onChange={(e) => {
-            const v = e.target.value;
+            const v = e.target.value.replace(/,/g, ".");
             setLocalVal(v);
             onCommitValue(test.test_id, lvl, v);
           }}
@@ -1214,8 +1410,9 @@ export default function App() {
   const [confirmPasswordInput, setConfirmPasswordInput] = useState("");
   const [pwChangeErr, setPwChangeErr] = useState("");
 
-  const todayIso = "2026-10-27";
-  const [runDate, setRunDate] = useState<string>(todayIso);
+  // HM 11: Chuẩn múi giờ Việt Nam UTC+7
+  const todayIso = getVnIsoDateString();
+  const [runDate, setRunDate] = useState<string>(() => getVnIsoDateString());
   const [liveTime, setLiveTime] = useState<string>(() =>
     new Date().toLocaleTimeString("vi-VN", { hour12: false })
   );
@@ -1261,6 +1458,45 @@ export default function App() {
   >(STORAGE_KEYS.INPUT_MODE, "CARD");
   const [useTimesIncrement, setUseTimesIncrement] = useState<number>(1);
 
+  // --- STATE AI VISION & LIÊN THÔNG ĐIỆN THOẠI <-> PC (ADD-ON V5.6) ---
+  const [aiConfig, setAiConfig] = usePersistentState<AiSystemConfig>(
+    STORAGE_KEYS.AI_CONFIG,
+    DEFAULT_AI_CONFIG
+  );
+  const [pendingSyncQueue, setPendingSyncQueue] = usePersistentState<
+    Record<string, any>[]
+  >(STORAGE_KEYS.SYNC_QUEUE, []);
+
+  const [aiTargetLevel, setAiTargetLevel] = useState<
+    "AUTO" | "L1" | "L2" | "L3"
+  >("AUTO");
+  const [autoPushAfterScan, setAutoPushAfterScan] = useState<boolean>(true);
+  const [isScanningImage, setIsScanningImage] = useState<boolean>(false);
+  const [aiScanStatusText, setAiScanStatusText] = useState<string>("");
+  const [aiLevelWarning, setAiLevelWarning] = useState<string | null>(null);
+  const [aiFilledMap, setAiFilledMap] = useState<
+    Record<string, { L1?: boolean; L2?: boolean; L3?: boolean }>
+  >({});
+  const [scannedImages, setScannedImages] = useState<
+    Partial<Record<"L1" | "L2" | "L3", string>>
+  >({});
+  const [activeImageTab, setActiveImageTab] = useState<"L1" | "L2" | "L3">(
+    "L1"
+  );
+  const [showImageComparePanel, setShowImageComparePanel] =
+    useState<boolean>(false);
+  const [isImageZoomed, setIsImageZoomed] = useState<boolean>(false);
+  const [pendingMobileDrafts, setPendingMobileDrafts] = useState<
+    MobileDraftIndexItem[]
+  >([]);
+  const [currentMachineDraft, setCurrentMachineDraft] =
+    useState<MobileDraftPayload | null>(null);
+  const [isPushingDraft, setIsPushingDraft] = useState<boolean>(false);
+  const [showMobileQrModal, setShowMobileQrModal] = useState<boolean>(false);
+
+  const cameraInputRef = useRef<HTMLInputElement | null>(null);
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
+
   const [activeTab, setActiveTab] = useState<NavTab>("DASHBOARD");
   const [expandedMetric, setExpandedMetric] = useState<1 | 2 | 3 | 4 | null>(1);
   const [m2Section, setM2Section] = useState<string>("Sinh Hóa");
@@ -1290,9 +1526,10 @@ export default function App() {
   const [selControl, setSelControl] = useState<string | null>(null);
   const [selLevel, setSelLevel] = useState<"L1" | "L2" | "L3">("L1");
 
-  const [savedValues, setSavedValues] = useState<
+  // HM 07: Lưu nháp Kiosk bền vững vào localStorage để chống sập RAM trình duyệt ĐT khi mở Camera
+  const [savedValues, setSavedValues] = usePersistentState<
     Record<string, { L1?: string; L2?: string; L3?: string }>
-  >({});
+  >(STORAGE_KEYS.KIOSK_DRAFT, {});
   const [tempInputs, setTempInputs] = useState<Record<string, string>>({});
   const [savedLevels, setSavedLevels] = useState<
     Record<string, { L1: boolean; L2: boolean; L3: boolean }>
@@ -1334,7 +1571,9 @@ export default function App() {
   >("DATE_RANGE");
   const [chartLotFilter, setChartLotFilter] = useState<string>("ALL");
   const [chartFromDate, setChartFromDate] = useState<string>("2026-09-26");
-  const [chartToDate, setChartToDate] = useState<string>("2026-10-27");
+  const [chartToDate, setChartToDate] = useState<string>(() =>
+    getVnIsoDateString()
+  );
   const [selectedPointInfo, setSelectedPointInfo] = useState<{
     levelKey: "L1" | "L2" | "L3";
     levelLabel: string;
@@ -1346,12 +1585,46 @@ export default function App() {
 
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
 
+  // HM 08: Đẩy bù các gói lưu lúc rớt mạng trước khi tải dữ liệu mới
+  const flushPendingOfflineQueue = useCallback(async (): Promise<boolean> => {
+    if (pendingSyncQueue.length === 0) return true;
+    const remaining: Record<string, any>[] = [];
+    for (let i = 0; i < pendingSyncQueue.length; i++) {
+      const item = pendingSyncQueue[i];
+      const res = await rpcCall(apiUrl, "save_batch", item, authToken);
+      if (!res.net || res.body?.status !== "success") {
+        remaining.push(...pendingSyncQueue.slice(i));
+        break;
+      }
+    }
+    setPendingSyncQueue(remaining);
+    return remaining.length === 0;
+  }, [pendingSyncQueue, apiUrl, authToken, setPendingSyncQueue]);
+
   const syncFromCloud = useCallback(async () => {
     setSyncBadge("Đang đồng bộ...");
+    if (pendingSyncQueue.length > 0) {
+      const okFlush = await flushPendingOfflineQueue();
+      if (!okFlush) {
+        setSyncBadge(`Còn ${pendingSyncQueue.length} gói chờ mạng`);
+        return;
+      }
+    }
+
     const res = await rpcCall(apiUrl, "get_bootstrap", {}, authToken);
     if (res.net && res.body?.status === "success" && res.body?.data) {
       const d = res.body.data;
       if (Array.isArray(d.section_locks)) setSectionLocks(d.section_locks);
+      if (Array.isArray(d.mobile_drafts))
+        setPendingMobileDrafts(d.mobile_drafts);
+      if (d.ai_config && typeof d.ai_config === "object") {
+        setAiConfig((prev) => ({
+          ...prev,
+          gemini_api_key:
+            d.ai_config.gemini_api_key || prev.gemini_api_key || "",
+          ai_model: d.ai_config.ai_model || prev.ai_model || "gemini-2.5-flash",
+        }));
+      }
       if (Array.isArray(d.users) && d.users.length > 0) {
         setUsers((prev) =>
           prev.map((u) => {
@@ -1377,7 +1650,19 @@ export default function App() {
     } else {
       setSyncBadge("Đã lưu bền vững (Local)");
     }
-  }, [apiUrl, authToken, setSectionLocks, setUsers]);
+  }, [
+    apiUrl,
+    authToken,
+    pendingSyncQueue.length,
+    flushPendingOfflineQueue,
+    setSectionLocks,
+    setAiConfig,
+    setUsers,
+  ]);
+
+  useEffect(() => {
+    syncFromCloud();
+  }, [syncFromCloud]);
 
   const getMachinesForSection = (sec: string) =>
     labMachines.filter((m) => m.section === sec).map((m) => m.machine);
@@ -1470,12 +1755,39 @@ export default function App() {
     const res = await rpcCall(
       apiUrl,
       "acquire_section_lock",
-      { section_name: sec },
+      {
+        section_name: sec,
+        user_id: currentUser.id,
+        user_name: currentUser.name,
+        user_role: currentUser.role,
+      },
       authToken
     );
     if (res.net && res.body?.data?.epoch)
       setMySectionEpoch(res.body.data.epoch);
   };
+
+  // HM 10: Nhịp tim (Heartbeat) tự động gia hạn khóa Lab mỗi 2 phút khi đang ở Kiosk
+  useEffect(() => {
+    if (!currentUser || activeTab !== "KIOSK" || !selSection) return;
+    const hb = window.setInterval(async () => {
+      const res = await rpcCall(
+        apiUrl,
+        "acquire_section_lock",
+        {
+          section_name: selSection,
+          user_id: currentUser.id,
+          user_name: currentUser.name,
+          user_role: currentUser.role,
+        },
+        authToken
+      );
+      if (res.net && res.body?.data?.section_locks) {
+        setSectionLocks(res.body.data.section_locks);
+      }
+    }, 120000);
+    return () => window.clearInterval(hb);
+  }, [currentUser, activeTab, selSection, apiUrl, authToken, setSectionLocks]);
 
   const handleForceUnlockSection = async (sec: string) => {
     if (!currentUser || !hasPermission(currentUser, "FORCE_UNLOCK_LAB")) return;
@@ -1641,6 +1953,13 @@ export default function App() {
         ...prev,
         [testId]: { ...(prev[testId] || {}), [lvl]: val },
       }));
+      setAiFilledMap((prev) => {
+        if (!prev[testId]?.[lvl]) return prev;
+        return {
+          ...prev,
+          [testId]: { ...prev[testId], [lvl]: false },
+        };
+      });
       if (selMachine && selControl) {
         const key = `${selMachine}__${selControl}`;
         setSavedLevels((prev) => ({
@@ -1652,8 +1971,285 @@ export default function App() {
         }));
       }
     },
-    [selMachine, selControl]
+    [selMachine, selControl, setSavedValues]
   );
+
+  // =========================================================================
+  // XỬ LÝ QUÉT ẢNH AI VISION & ĐẨY BẢN NHÁP ĐIỆN THOẠI <-> MÁY TÍNH (V5.6)
+  // =========================================================================
+  const checkMobileDraftForCurrentControl = useCallback(
+    async (mac: string | null, ctrl: string | null) => {
+      if (!mac || !ctrl) {
+        setCurrentMachineDraft(null);
+        return;
+      }
+      const res = await rpcCall(
+        apiUrl,
+        "get_mobile_draft",
+        { machine_name: mac, control_name: ctrl },
+        authToken
+      );
+      if (res.net && res.body?.status === "success" && res.body.data) {
+        if (Array.isArray(res.body.data.pending_list)) {
+          setPendingMobileDrafts(res.body.data.pending_list);
+        }
+        if (res.body.data.has_draft && res.body.data.draft) {
+          setCurrentMachineDraft(res.body.data.draft as MobileDraftPayload);
+        } else {
+          setCurrentMachineDraft(null);
+        }
+      }
+    },
+    [apiUrl, authToken]
+  );
+
+  useEffect(() => {
+    if (
+      activeTab === "KIOSK" &&
+      (step === "SELECT_LEVEL" || step === "ENTER_RESULTS") &&
+      selMachine &&
+      selControl
+    ) {
+      checkMobileDraftForCurrentControl(selMachine, selControl);
+    }
+  }, [
+    activeTab,
+    step,
+    selMachine,
+    selControl,
+    checkMobileDraftForCurrentControl,
+  ]);
+
+  const handleImageFileSelected = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !selMachine || !selControl) return;
+
+    const testsInCtrl = getTestsForControl(selMachine, selControl);
+    if (testsInCtrl.length === 0) return;
+
+    setIsScanningImage(true);
+    setAiLevelWarning(null);
+    setAiScanStatusText("Đang nén ảnh kép bằng HTML5 Canvas...");
+
+    try {
+      const compressed = await compressImageDual(file);
+      setAiScanStatusText(
+        "Đang phân tích chỉ số QC bằng Gemini Vision AI (Ngữ cảnh Mean ± SD)..."
+      );
+
+      const requestedLv = step === "ENTER_RESULTS" ? selLevel : aiTargetLevel;
+
+      const scanResult = await analyzeQcImageWithAI({
+        ocrBase64: compressed.ocrBase64,
+        tests: testsInCtrl,
+        requestedLevel: requestedLv,
+        aiConfig,
+        apiUrl,
+        authToken,
+      });
+
+      const appliedLv = scanResult.targetLevelApplied;
+      if (scanResult.matchedCount === 0) {
+        window.alert(
+          "AI không tìm thấy chỉ số nào khớp với danh mục của máy này trong bức ảnh. Hãy chụp rõ cột kết quả hơn!"
+        );
+        setIsScanningImage(false);
+        setAiScanStatusText("");
+        return;
+      }
+
+      const nextValuesPatch: Record<
+        string,
+        { L1?: string; L2?: string; L3?: string }
+      > = {};
+      const nextFlagsPatch: Record<
+        string,
+        { L1?: boolean; L2?: boolean; L3?: boolean }
+      > = {};
+
+      Object.entries(scanResult.extractedValues).forEach(([tid, valStr]) => {
+        nextValuesPatch[tid] = {
+          ...(savedValues[tid] || {}),
+          [appliedLv]: valStr,
+        };
+        nextFlagsPatch[tid] = {
+          ...(aiFilledMap[tid] || {}),
+          [appliedLv]: true,
+        };
+      });
+
+      setSavedValues((prev) => ({ ...prev, ...nextValuesPatch }));
+      setAiFilledMap((prev) => ({ ...prev, ...nextFlagsPatch }));
+
+      if (step === "ENTER_RESULTS" && appliedLv === selLevel) {
+        setTempInputs((prev) => ({
+          ...prev,
+          ...scanResult.extractedValues,
+        }));
+      }
+
+      const key = ctrlKey(selMachine, selControl);
+      setSavedLevels((prev) => ({
+        ...prev,
+        [key]: {
+          ...(prev[key] || { L1: false, L2: false, L3: false }),
+          [appliedLv]: true,
+        },
+      }));
+
+      setScannedImages((prev) => ({
+        ...prev,
+        [appliedLv]: compressed.handoffBase64,
+      }));
+      setActiveImageTab(appliedLv);
+      setShowImageComparePanel(true);
+
+      if (scanResult.levelMismatchWarning) {
+        setAiLevelWarning(scanResult.levelMismatchWarning);
+      }
+
+      if (autoPushAfterScan && currentUser) {
+        setAiScanStatusText("Đang tự động đồng bộ bản nháp lên Cloud...");
+        await rpcCall(
+          apiUrl,
+          "save_mobile_draft",
+          {
+            section_name: selSection,
+            machine_name: selMachine,
+            control_name: selControl,
+            operator_name: currentUser.name,
+            run_date: runDate,
+            values: nextValuesPatch,
+            ai_flags: nextFlagsPatch,
+            level: appliedLv,
+            image_base64: compressed.handoffBase64,
+          },
+          authToken,
+          22000
+        );
+      }
+      setSyncBadge(
+        `✨ AI đã điền ${scanResult.matchedCount} chỉ số (${appliedLv})`
+      );
+    } catch (err: any) {
+      window.alert(
+        String(
+          err?.message ||
+            "Lỗi khi quét ảnh bằng AI. Vui lòng kiểm tra Khóa Gemini API Key trong Tab Quản lý Admin!"
+        )
+      );
+    } finally {
+      setIsScanningImage(false);
+      setAiScanStatusText("");
+    }
+  };
+
+  const handlePushMobileDraftToPc = async () => {
+    if (!selMachine || !selControl || !currentUser) return;
+    const testsInCtrl = getTestsForControl(selMachine, selControl);
+    const valuesForCtrl: Record<
+      string,
+      { L1?: string; L2?: string; L3?: string }
+    > = {};
+    const flagsForCtrl: Record<
+      string,
+      { L1?: boolean; L2?: boolean; L3?: boolean }
+    > = {};
+    let hasAny = false;
+
+    testsInCtrl.forEach((t) => {
+      const rv = savedValues[t.test_id];
+      if (rv && (rv.L1 || rv.L2 || rv.L3)) {
+        valuesForCtrl[t.test_id] = rv;
+        hasAny = true;
+      }
+      if (aiFilledMap[t.test_id]) {
+        flagsForCtrl[t.test_id] = aiFilledMap[t.test_id];
+      }
+    });
+
+    if (
+      !hasAny &&
+      !scannedImages.L1 &&
+      !scannedImages.L2 &&
+      !scannedImages.L3
+    ) {
+      window.alert("Chưa có số liệu hoặc ảnh chụp nào để đẩy sang Máy tính!");
+      return;
+    }
+
+    setIsPushingDraft(true);
+    const res = await rpcCall(
+      apiUrl,
+      "save_mobile_draft",
+      {
+        section_name: selSection,
+        machine_name: selMachine,
+        control_name: selControl,
+        operator_name: currentUser.name,
+        run_date: runDate,
+        values: valuesForCtrl,
+        ai_flags: flagsForCtrl,
+        images: scannedImages,
+      },
+      authToken,
+      25000
+    );
+    setIsPushingDraft(false);
+
+    if (res.net && res.body?.status === "success") {
+      setSyncBadge("📲 Đã đẩy bản nháp sang PC");
+      checkMobileDraftForCurrentControl(selMachine, selControl);
+    } else {
+      window.alert("Không thể đẩy bản nháp. Vui lòng kiểm tra kết nối mạng!");
+    }
+  };
+
+  const handleApplyMobileDraftOnPc = (draft: MobileDraftPayload) => {
+    if (!selMachine || !selControl) return;
+    setSavedValues((prev) => ({
+      ...prev,
+      ...(draft.values || {}),
+    }));
+
+    const nextFlags: Record<
+      string,
+      { L1?: boolean; L2?: boolean; L3?: boolean }
+    > = {};
+    Object.keys(draft.values || {}).forEach((tid) => {
+      const v = draft.values[tid] || {};
+      nextFlags[tid] = {
+        L1: Boolean(v.L1),
+        L2: Boolean(v.L2),
+        L3: Boolean(v.L3),
+      };
+    });
+    setAiFilledMap((prev) => ({ ...prev, ...nextFlags }));
+
+    const key = ctrlKey(selMachine, selControl);
+    setSavedLevels((prev) => ({
+      ...prev,
+      [key]: {
+        L1: prev[key]?.L1 || (draft.active_levels || []).includes("L1"),
+        L2: prev[key]?.L2 || (draft.active_levels || []).includes("L2"),
+        L3: prev[key]?.L3 || (draft.active_levels || []).includes("L3"),
+      },
+    }));
+
+    if (draft.images && Object.keys(draft.images).length > 0) {
+      setScannedImages((prev) => ({ ...prev, ...draft.images }));
+      const firstLv = (["L1", "L2", "L3"] as const).find(
+        (lv) => draft.images[lv]
+      );
+      if (firstLv) setActiveImageTab(firstLv);
+      setShowImageComparePanel(true);
+    }
+    setKioskInputMode("GRID");
+    setSyncBadge("💻 Đã nạp bản nháp từ Điện thoại");
+  };
 
   // --- MỞ MODAL KHẮC PHỤC SỰ CỐ: TỰ ĐỘNG KHÓA ĐÚNG MỨC BỊ LỖI ---
   const openSmartCorrectiveModalFromLog = (log: BM09LogEntry, idx: number) => {
@@ -1732,7 +2328,7 @@ export default function App() {
       const shortDate = logDate.slice(8, 10) + "/" + logDate.slice(5, 7);
 
       violatedLevels.forEach((lv) => {
-        const rawStr = (reRunInputs[lv] || "").trim();
+        const rawStr = (reRunInputs[lv] || "").trim().replace(/,/g, ".");
         if (rawStr === "") return;
         const num = parseFloat(rawStr);
         const meanRef =
@@ -1796,13 +2392,13 @@ export default function App() {
               ...c,
               accumulated_points: c.accumulated_points + 1,
               history_L1: newPtsByLevel.L1
-                ? [...c.history_L1, newPtsByLevel.L1]
+                ? sortHistoryPoints([...c.history_L1, newPtsByLevel.L1])
                 : c.history_L1,
               history_L2: newPtsByLevel.L2
-                ? [...c.history_L2, newPtsByLevel.L2]
+                ? sortHistoryPoints([...c.history_L2, newPtsByLevel.L2])
                 : c.history_L2,
               history_L3: newPtsByLevel.L3
-                ? [...(c.history_L3 || []), newPtsByLevel.L3]
+                ? sortHistoryPoints([...(c.history_L3 || []), newPtsByLevel.L3])
                 : c.history_L3 || [],
             };
           })
@@ -2104,6 +2700,23 @@ export default function App() {
         .matte-warn { background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); color: #92400e; border-color: #f59e0b; }
       `}</style>
 
+      {/* INPUT FILE ẨN CHO CAMERA ĐIỆN THOẠI & CHỌN ẢNH TRONG MÁY */}
+      <input
+        ref={cameraInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handleImageFileSelected}
+        className="hidden"
+      />
+      <input
+        ref={galleryInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleImageFileSelected}
+        className="hidden"
+      />
+
       {/* HEADER ĐIỀU HƯỚNG CHÍNH */}
       <header className="no-print bg-white/95 backdrop-blur-md border-b border-slate-200/90 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2.5 sticky top-0 z-30 shadow-sm">
         <div className="flex items-center space-x-3">
@@ -2116,6 +2729,11 @@ export default function App() {
               <span className="rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase whitespace-nowrap bg-blue-600 text-white inline-flex items-center justify-center tracking-wider shadow-sm">
                 ISO 15189:2022 · QĐ 2429
               </span>
+              {pendingMobileDrafts.length > 0 && (
+                <span className="rounded-full px-2 py-0.5 text-[10px] font-black bg-amber-400 text-slate-950 animate-pulse">
+                  📲 {pendingMobileDrafts.length} nháp ĐT
+                </span>
+              )}
             </div>
             <div className="text-[10.5px] font-bold italic gold-shimmer">
               ✦ An intellectual product by Handsome Long ✦
@@ -2149,6 +2767,14 @@ export default function App() {
               {currentUser.role}
             </span>
           </div>
+          <button
+            type="button"
+            onClick={() => setShowMobileQrModal(true)}
+            className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-[10.5px] font-black transition"
+            title="Mở mã QR để quét bằng Camera điện thoại"
+          >
+            📱 QR ĐT
+          </button>
           <button
             type="button"
             onClick={syncFromCloud}
@@ -2205,7 +2831,12 @@ export default function App() {
                       l.user_id.toLowerCase() !== currentUser.id.toLowerCase()
                   )
                 );
-                rpcCall(apiUrl, "release_section_lock", {}, authToken);
+                rpcCall(
+                  apiUrl,
+                  "release_section_lock",
+                  { user_id: currentUser.id },
+                  authToken
+                );
               }
               setCurrentUser(null);
             }}
@@ -2217,6 +2848,7 @@ export default function App() {
         </div>
       </header>
 
+      {/* === ĐIỂM NỐI: DÁN TIẾP PART 2 NGAY BÊN DƯỚI DÒNG NÀY === */}
       <main className="max-w-7xl mx-auto p-5">
         {/* ------------------------------------------------------------------- */}
         {/* 1. DASHBOARD TỔNG QUAN & BẢNG GIÁM SÁT KHẮC PHỤC SỰ CỐ              */}
@@ -2703,6 +3335,12 @@ export default function App() {
                                 L2: <b>{log.val_L2}</b> ({log.z_L2}SD)
                               </span>
                             )}
+                            {log.val_L3 !== null &&
+                              log.val_L3 !== undefined && (
+                                <span className="ml-2">
+                                  L3: <b>{log.val_L3}</b> ({log.z_L3}SD)
+                                </span>
+                              )}
                           </div>
                           {log.post_fix_result && (
                             <div
@@ -2772,7 +3410,7 @@ export default function App() {
         )}
 
         {/* ------------------------------------------------------------------- */}
-        {/* 2. KIOSK NHẬP KẾT QUẢ QC                                             */}
+        {/* 2. KIOSK NHẬP KẾT QUẢ QC (TÍCH HỢP QUÉT ẢNH AI & HANDOFF ĐT <-> PC)  */}
         {/* ------------------------------------------------------------------- */}
         {activeTab === "KIOSK" && (
           <div className="space-y-4">
@@ -2791,6 +3429,9 @@ export default function App() {
                     Boolean(lock) &&
                     lock!.user_id.toLowerCase() ===
                       currentUser.id.toLowerCase();
+                  const draftsInSec = pendingMobileDrafts.filter(
+                    (d) => d.section_name === sec
+                  );
                   return (
                     <div key={sec} className="inline-flex items-center gap-1">
                       <button
@@ -2806,6 +3447,11 @@ export default function App() {
                       >
                         {isLockedByOther && <Ic.Lock />}
                         <span>{sec}</span>
+                        {draftsInSec.length > 0 && (
+                          <span className="px-1.5 py-0.5 rounded bg-amber-400 text-slate-950 text-[10px] font-black">
+                            📲 {draftsInSec.length}
+                          </span>
+                        )}
                         {isLockedByOther && (
                           <span className="text-[10px] bg-rose-600 text-white px-1.5 py-0.5 rounded-md font-bold">
                             Đang nhập: {lock!.user_name}
@@ -2890,6 +3536,9 @@ export default function App() {
                   {getMachinesForSection(selSection).map((m) => {
                     const completed = isMachineCompleted(m);
                     const partial = isMachinePartial(m);
+                    const hasMobileDraft = pendingMobileDrafts.some(
+                      (d) => d.machine_name === m
+                    );
                     return (
                       <button
                         key={m}
@@ -2921,21 +3570,28 @@ export default function App() {
                           <span className="p-2.5 rounded-xl bg-white text-blue-600 shadow-sm border border-slate-100">
                             <Ic.Cpu />
                           </span>
-                          <span
-                            className={`text-[10px] font-extrabold uppercase px-2.5 py-0.5 rounded-full ${
-                              completed
-                                ? "bg-amber-500 text-white"
+                          <div className="flex items-center gap-1.5">
+                            {hasMobileDraft && (
+                              <span className="text-[10px] font-black px-2 py-0.5 rounded-full bg-amber-400 text-slate-950 animate-pulse">
+                                📲 Có nháp ĐT
+                              </span>
+                            )}
+                            <span
+                              className={`text-[10px] font-extrabold uppercase px-2.5 py-0.5 rounded-full ${
+                                completed
+                                  ? "bg-amber-500 text-white"
+                                  : partial
+                                  ? "bg-indigo-600 text-white"
+                                  : "bg-sky-600 text-white"
+                              }`}
+                            >
+                              {completed
+                                ? "Hoàn tất"
                                 : partial
-                                ? "bg-indigo-600 text-white"
-                                : "bg-sky-600 text-white"
-                            }`}
-                          >
-                            {completed
-                              ? "Hoàn tất"
-                              : partial
-                              ? "Đang nhập"
-                              : "Sẵn sàng"}
-                          </span>
+                                ? "Đang nhập"
+                                : "Sẵn sàng"}
+                            </span>
+                          </div>
                         </div>
                         <div className="text-lg font-black text-slate-900">
                           {m}
@@ -3058,11 +3714,12 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
+                    {/* HM 18: Cho phép chọn 0 lần khi chỉ nhập bổ sung xét nghiệm chạy muộn */}
                     <div className="flex items-center gap-1.5 bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-xl text-xs">
                       <span className="font-bold text-amber-900">
                         Số lần dùng hóa chất:
                       </span>
-                      {[1, 2, 3].map((n) => (
+                      {[0, 1, 2, 3].map((n) => (
                         <button
                           key={n}
                           type="button"
@@ -3086,232 +3743,475 @@ export default function App() {
                   </div>
                 </div>
 
-                {kioskInputMode === "GRID" ? (
-                  <div className="overflow-x-auto border border-slate-200 rounded-2xl">
-                    <table className="w-full text-left border-collapse text-xs">
-                      <thead>
-                        <tr className="bg-slate-900 text-white uppercase text-[11px]">
-                          <th className="py-2.5 px-3 w-10 text-center">STT</th>
-                          <th className="py-2.5 px-3">Xét nghiệm</th>
-                          <th className="py-2.5 px-3 text-center">
-                            Range áp dụng
-                          </th>
-                          <th className="py-2.5 px-3 text-right">
-                            Mức 1 (Mean ± SD)
-                          </th>
-                          <th className="py-2.5 px-3 text-right">
-                            Mức 2 (Mean ± SD)
-                          </th>
-                          <th className="py-2.5 px-3 text-right">
-                            Mức 3 (Nếu có)
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-200 bg-white">
-                        {getTestsForControl(selMachine, selControl).map(
-                          (t, idx) => {
-                            const isLabRange =
-                              t.range_source !== "MANUFACTURER";
-                            const v1 = savedValues[t.test_id]?.L1 ?? "";
-                            const v2 = savedValues[t.test_id]?.L2 ?? "";
-                            const v3 = savedValues[t.test_id]?.L3 ?? "";
-                            return (
-                              <tr
-                                key={t.test_id}
-                                className="hover:bg-sky-50/40"
-                              >
-                                <td className="py-2 px-3 text-center font-mono font-bold text-slate-500">
-                                  {idx + 1}
-                                </td>
-                                <td className="py-2 px-3">
-                                  <div className="flex items-center gap-1.5 flex-wrap">
-                                    <span className="font-black text-slate-900">
-                                      {t.test_name}
-                                    </span>
-                                    <span className="text-[11px] text-slate-500">
-                                      ({t.unit})
-                                    </span>
-                                    {t.standard_label === "ISO" && (
-                                      <span className="rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase whitespace-nowrap bg-blue-600 text-white inline-flex items-center justify-center tracking-wider shadow-sm ml-1">
-                                        ISO 15189
-                                      </span>
-                                    )}
-                                    {t.is_exempt_long_rules && (
-                                      <span className="rounded-full px-2 py-0.5 text-[9.5px] font-black uppercase whitespace-nowrap bg-amber-500 text-white">
-                                        Ngoại lệ 6x/8x/10x
-                                      </span>
-                                    )}
-                                  </div>
-                                </td>
-                                <td className="py-2 px-3 text-center whitespace-nowrap">
-                                  <span
-                                    className={`px-2 py-0.5 rounded-md text-[10px] font-black inline-block whitespace-nowrap ${
-                                      isLabRange
-                                        ? "neon-purple-range"
-                                        : "neon-lime-range"
-                                    }`}
-                                  >
-                                    {isLabRange ? "Range Phòng" : "Range Hãng"}
-                                  </span>
-                                </td>
-                                <GridLevelCell
-                                  test={t}
-                                  lvl="L1"
-                                  initialValue={v1}
-                                  inputRefCallback={(el) =>
-                                    (inputRefs.current[`grid-L1-${idx}`] = el)
-                                  }
-                                  onNavigateRow={(delta) => {
-                                    const nextEl =
-                                      inputRefs.current[
-                                        `grid-L1-${idx + delta}`
-                                      ];
-                                    if (nextEl) {
-                                      nextEl.focus();
-                                      nextEl.select();
-                                    }
-                                  }}
-                                  onCommitValue={handleCommitGridValue}
-                                />
-                                <GridLevelCell
-                                  test={t}
-                                  lvl="L2"
-                                  initialValue={v2}
-                                  inputRefCallback={(el) =>
-                                    (inputRefs.current[`grid-L2-${idx}`] = el)
-                                  }
-                                  onNavigateRow={(delta) => {
-                                    const nextEl =
-                                      inputRefs.current[
-                                        `grid-L2-${idx + delta}`
-                                      ];
-                                    if (nextEl) {
-                                      nextEl.focus();
-                                      nextEl.select();
-                                    }
-                                  }}
-                                  onCommitValue={handleCommitGridValue}
-                                />
-                                <GridLevelCell
-                                  test={t}
-                                  lvl="L3"
-                                  initialValue={v3}
-                                  inputRefCallback={(el) =>
-                                    (inputRefs.current[`grid-L3-${idx}`] = el)
-                                  }
-                                  onNavigateRow={(delta) => {
-                                    const nextEl =
-                                      inputRefs.current[
-                                        `grid-L3-${idx + delta}`
-                                      ];
-                                    if (nextEl) {
-                                      nextEl.focus();
-                                      nextEl.select();
-                                    }
-                                  }}
-                                  onCommitValue={handleCommitGridValue}
-                                />
-                              </tr>
-                            );
-                          }
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-                ) : (
-                  (() => {
-                    const testsInCtrl = getTestsForControl(
-                      selMachine,
-                      selControl
-                    );
-                    const maxLv = Math.max(
-                      1,
-                      ...testsInCtrl.map((t) => t.levels_count || 2)
-                    ) as 1 | 2 | 3;
-                    const levelList: ("L1" | "L2" | "L3")[] =
-                      maxLv === 3
-                        ? ["L1", "L2", "L3"]
-                        : maxLv === 2
-                        ? ["L1", "L2"]
-                        : ["L1"];
-                    return (
-                      <div
-                        className={`grid grid-cols-1 ${
-                          maxLv === 3
-                            ? "md:grid-cols-3"
-                            : maxLv === 2
-                            ? "md:grid-cols-2"
-                            : "md:grid-cols-1"
-                        } gap-4 max-w-4xl mx-auto`}
+                {/* ========================================================= */}
+                {/* THANH CÔNG CỤ QUÉT ẢNH AI & LIÊN THÔNG ĐT <-> PC (V5.6)    */}
+                {/* ========================================================= */}
+                <div className="bg-gradient-to-r from-indigo-50/90 via-amber-50/60 to-sky-50/80 border border-indigo-200 rounded-2xl p-3.5 space-y-2.5 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-black text-indigo-950 flex items-center gap-1">
+                        <span>🤖 Quét Ảnh QC (AI):</span>
+                      </span>
+                      <select
+                        value={aiTargetLevel}
+                        onChange={(e) =>
+                          setAiTargetLevel(
+                            e.target.value as "AUTO" | "L1" | "L2" | "L3"
+                          )
+                        }
+                        className="bg-white border border-indigo-300 rounded-xl px-2.5 py-1.5 font-bold text-indigo-900"
                       >
-                        {levelList.map((lvl) => {
-                          const saved = isLevelSaved(
+                        <option value="AUTO">
+                          ✨ Tự nhận diện Mức (Auto L1/L2/L3)
+                        </option>
+                        <option value="L1">Điền vào Mức 1 (L1)</option>
+                        <option value="L2">Điền vào Mức 2 (L2)</option>
+                        <option value="L3">Điền vào Mức 3 (L3)</option>
+                      </select>
+
+                      <button
+                        type="button"
+                        disabled={isScanningImage}
+                        onClick={() => cameraInputRef.current?.click()}
+                        className="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-black shadow-sm transition disabled:opacity-50"
+                      >
+                        {isScanningImage
+                          ? "⏳ Đang đọc ảnh..."
+                          : "📸 Chụp Camera QC"}
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={isScanningImage}
+                        onClick={() => galleryInputRef.current?.click()}
+                        className="px-3 py-1.5 rounded-xl bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 font-bold shadow-xs transition disabled:opacity-50"
+                      >
+                        🖼️ Chọn Ảnh Trong Máy
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label className="flex items-center gap-1 bg-white px-2.5 py-1 rounded-xl border border-indigo-200 font-bold text-indigo-900 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoPushAfterScan}
+                          onChange={(e) =>
+                            setAutoPushAfterScan(e.target.checked)
+                          }
+                          className="accent-indigo-600 rounded"
+                        />
+                        <span>Tự đẩy Cloud</span>
+                      </label>
+
+                      <button
+                        type="button"
+                        disabled={isPushingDraft}
+                        onClick={handlePushMobileDraftToPc}
+                        className="px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-black shadow-sm transition disabled:opacity-50"
+                      >
+                        {isPushingDraft
+                          ? "⏳ Đang gửi..."
+                          : "📲 Đẩy Bản Nháp Sang Máy Tính"}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          checkMobileDraftForCurrentControl(
                             selMachine,
-                            selControl,
-                            lvl
-                          );
-                          return (
-                            <button
-                              key={lvl}
-                              onClick={() => {
-                                setSelLevel(lvl);
-                                if (saved) {
-                                  setWarningModal({
-                                    open: true,
-                                    type: "LEVEL",
-                                    machine: selMachine,
-                                    control: selControl,
-                                    level: lvl,
-                                  });
-                                  setSearchQuery("");
-                                  setEditDrafts({});
-                                  return;
-                                }
-                                const initTemp: Record<string, string> = {};
-                                testsInCtrl.forEach((t) => {
-                                  initTemp[t.test_id] =
-                                    savedValues[t.test_id]?.[lvl] ??
-                                    (t.test_type === "QUALITATIVE"
-                                      ? lvl === "L1"
-                                        ? t.expected_qual_L1 || "ÂM TÍNH"
-                                        : lvl === "L2"
-                                        ? t.expected_qual_L2 || "DƯƠNG TÍNH"
-                                        : t.expected_qual_L3 || "DƯƠNG TÍNH"
-                                      : "");
-                                });
-                                setTempInputs(initTemp);
-                                setStep("ENTER_RESULTS");
-                              }}
-                              className={`rounded-2xl p-5 text-left border-2 border-b-[5px] transition-all hover:-translate-y-0.5 ${
-                                saved
-                                  ? "bg-gradient-to-b from-emerald-500 to-emerald-600 border-emerald-700 text-white shadow-lg"
-                                  : "bg-gradient-to-b from-sky-500 to-blue-600 border-blue-800 text-white shadow-lg"
-                              }`}
-                            >
-                              <div className="flex items-center justify-between mb-2">
-                                <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-black/20">
-                                  {lvl === "L1"
-                                    ? "Mức 1"
-                                    : lvl === "L2"
-                                    ? "Mức 2"
-                                    : "Mức 3"}
-                                </span>
-                                {saved && <Ic.Check />}
-                              </div>
-                              <div className="text-xl font-black">
-                                {lvl === "L1"
-                                  ? "MỨC 1 (LEVEL 1)"
-                                  : lvl === "L2"
-                                  ? "MỨC 2 (LEVEL 2)"
-                                  : "MỨC 3 (LEVEL 3)"}
-                              </div>
-                            </button>
-                          );
-                        })}
+                            selControl
+                          )
+                        }
+                        className="px-2.5 py-1.5 rounded-xl bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 font-bold"
+                      >
+                        🔄 Kiểm tra nháp ĐT
+                      </button>
+
+                      {(scannedImages.L1 ||
+                        scannedImages.L2 ||
+                        scannedImages.L3) && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setShowImageComparePanel(!showImageComparePanel)
+                          }
+                          className="px-2.5 py-1.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 font-black"
+                        >
+                          {showImageComparePanel
+                            ? "Ẩn Ảnh Gốc"
+                            : "👁️ Xem Ảnh Gốc"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {isScanningImage && aiScanStatusText && (
+                    <div className="p-2 rounded-xl bg-indigo-900 text-white font-bold animate-pulse">
+                      ⚡ {aiScanStatusText}
+                    </div>
+                  )}
+
+                  {aiLevelWarning && (
+                    <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-300 text-rose-800 font-bold flex items-center justify-between gap-2">
+                      <span>{aiLevelWarning}</span>
+                      <button
+                        type="button"
+                        onClick={() => setAiLevelWarning(null)}
+                        className="px-2 py-0.5 rounded bg-rose-200 text-rose-900 text-[11px]"
+                      >
+                        Đã hiểu
+                      </button>
+                    </div>
+                  )}
+
+                  {currentMachineDraft && (
+                    <div className="p-2.5 rounded-xl bg-amber-100 border-2 border-amber-400 text-amber-950 flex flex-wrap items-center justify-between gap-2">
+                      <span className="font-bold">
+                        🔔 Có bản nháp QC vừa chụp từ Điện thoại (
+                        {currentMachineDraft.operator_name} · Mức:{" "}
+                        {currentMachineDraft.active_levels.join(", ")})
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleApplyMobileDraftOnPc(currentMachineDraft)
+                          }
+                          className="px-3 py-1 rounded-xl bg-slate-900 hover:bg-slate-800 text-amber-300 font-black shadow"
+                        >
+                          📥 Nạp Số Liệu & Ảnh Lên Màn Hình PC
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            setCurrentMachineDraft(null);
+                            await rpcCall(
+                              apiUrl,
+                              "clear_mobile_draft",
+                              {
+                                machine_name: selMachine,
+                                control_name: selControl,
+                              },
+                              authToken
+                            );
+                          }}
+                          className="px-2 py-1 rounded-xl bg-white text-rose-700 border border-amber-300 font-bold"
+                        >
+                          Xóa nháp
+                        </button>
                       </div>
-                    );
-                  })()
-                )}
+                    </div>
+                  )}
+                </div>
+
+                {/* KHUNG CHIA ĐÔI MÀN HÌNH ĐỐI CHIẾU ẢNH GỐC (KHI BẬT XEM ẢNH) */}
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+                  {showImageComparePanel &&
+                    (scannedImages.L1 ||
+                      scannedImages.L2 ||
+                      scannedImages.L3) && (
+                      <div className="lg:col-span-5 bg-slate-900 text-white rounded-2xl p-3.5 space-y-2.5 shadow-lg">
+                        <div className="flex items-center justify-between">
+                          <span className="font-black text-amber-300 text-xs">
+                            🖼️ Ảnh Gốc Đối Chiếu (Human-in-the-loop)
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            {(["L1", "L2", "L3"] as const).map((lv) =>
+                              scannedImages[lv] ? (
+                                <button
+                                  key={lv}
+                                  type="button"
+                                  onClick={() => setActiveImageTab(lv)}
+                                  className={`px-2.5 py-0.5 rounded-lg text-[11px] font-black ${
+                                    activeImageTab === lv
+                                      ? "bg-amber-400 text-slate-950"
+                                      : "bg-slate-800 text-slate-300"
+                                  }`}
+                                >
+                                  {lv}
+                                </button>
+                              ) : null
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setIsImageZoomed(!isImageZoomed)}
+                              className="px-2 py-0.5 rounded-lg bg-slate-800 text-sky-300 text-[11px] font-bold"
+                            >
+                              {isImageZoomed ? "Thu nhỏ" : "Phóng to"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setShowImageComparePanel(false)}
+                              className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-300 text-[11px]"
+                            >
+                              ✕
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="rounded-xl overflow-auto max-h-[480px] bg-black border border-slate-700 flex items-center justify-center">
+                          {scannedImages[activeImageTab] && (
+                            <img
+                              src={scannedImages[activeImageTab]}
+                              alt={`QC ${activeImageTab}`}
+                              className={
+                                isImageZoomed
+                                  ? "max-w-none w-[150%]"
+                                  : "w-full h-auto object-contain"
+                              }
+                            />
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                  <div
+                    className={
+                      showImageComparePanel &&
+                      (scannedImages.L1 || scannedImages.L2 || scannedImages.L3)
+                        ? "lg:col-span-7"
+                        : "lg:col-span-12"
+                    }
+                  >
+                    {kioskInputMode === "GRID" ? (
+                      <div className="overflow-x-auto border border-slate-200 rounded-2xl">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="bg-slate-900 text-white uppercase text-[11px]">
+                              <th className="py-2.5 px-3 w-10 text-center">
+                                STT
+                              </th>
+                              <th className="py-2.5 px-3">Xét nghiệm</th>
+                              <th className="py-2.5 px-3 text-center">
+                                Range áp dụng
+                              </th>
+                              <th className="py-2.5 px-3 text-right">
+                                Mức 1 (Mean ± SD)
+                              </th>
+                              <th className="py-2.5 px-3 text-right">
+                                Mức 2 (Mean ± SD)
+                              </th>
+                              <th className="py-2.5 px-3 text-right">
+                                Mức 3 (Nếu có)
+                              </th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-200 bg-white">
+                            {getTestsForControl(selMachine, selControl).map(
+                              (t, idx) => {
+                                const isLabRange =
+                                  t.range_source !== "MANUFACTURER";
+                                const v1 = savedValues[t.test_id]?.L1 ?? "";
+                                const v2 = savedValues[t.test_id]?.L2 ?? "";
+                                const v3 = savedValues[t.test_id]?.L3 ?? "";
+                                const aiFlags = aiFilledMap[t.test_id] || {};
+                                return (
+                                  <tr
+                                    key={t.test_id}
+                                    className="hover:bg-sky-50/40"
+                                  >
+                                    <td className="py-2 px-3 text-center font-mono font-bold text-slate-500">
+                                      {idx + 1}
+                                    </td>
+                                    <td className="py-2 px-3">
+                                      <div className="flex items-center gap-1.5 flex-wrap">
+                                        <span className="font-black text-slate-900">
+                                          {t.test_name}
+                                        </span>
+                                        <span className="text-[11px] text-slate-500">
+                                          ({t.unit})
+                                        </span>
+                                        {t.standard_label === "ISO" && (
+                                          <span className="rounded-full px-2.5 py-0.5 text-[10px] font-black uppercase whitespace-nowrap bg-blue-600 text-white inline-flex items-center justify-center tracking-wider shadow-sm ml-1">
+                                            ISO 15189
+                                          </span>
+                                        )}
+                                        {t.is_exempt_long_rules && (
+                                          <span className="rounded-full px-2 py-0.5 text-[9.5px] font-black uppercase whitespace-nowrap bg-amber-500 text-white">
+                                            Ngoại lệ 6x/8x/10x
+                                          </span>
+                                        )}
+                                      </div>
+                                    </td>
+                                    <td className="py-2 px-3 text-center whitespace-nowrap">
+                                      <span
+                                        className={`px-2 py-0.5 rounded-md text-[10px] font-black inline-block whitespace-nowrap ${
+                                          isLabRange
+                                            ? "neon-purple-range"
+                                            : "neon-lime-range"
+                                        }`}
+                                      >
+                                        {isLabRange
+                                          ? "Range Phòng"
+                                          : "Range Hãng"}
+                                      </span>
+                                    </td>
+                                    <GridLevelCell
+                                      test={t}
+                                      lvl="L1"
+                                      initialValue={v1}
+                                      isAiFilled={Boolean(aiFlags.L1)}
+                                      inputRefCallback={(el) =>
+                                        (inputRefs.current[`grid-L1-${idx}`] =
+                                          el)
+                                      }
+                                      onNavigateRow={(delta) => {
+                                        const nextEl =
+                                          inputRefs.current[
+                                            `grid-L1-${idx + delta}`
+                                          ];
+                                        if (nextEl) {
+                                          nextEl.focus();
+                                          nextEl.select();
+                                        }
+                                      }}
+                                      onCommitValue={handleCommitGridValue}
+                                    />
+                                    <GridLevelCell
+                                      test={t}
+                                      lvl="L2"
+                                      initialValue={v2}
+                                      isAiFilled={Boolean(aiFlags.L2)}
+                                      inputRefCallback={(el) =>
+                                        (inputRefs.current[`grid-L2-${idx}`] =
+                                          el)
+                                      }
+                                      onNavigateRow={(delta) => {
+                                        const nextEl =
+                                          inputRefs.current[
+                                            `grid-L2-${idx + delta}`
+                                          ];
+                                        if (nextEl) {
+                                          nextEl.focus();
+                                          nextEl.select();
+                                        }
+                                      }}
+                                      onCommitValue={handleCommitGridValue}
+                                    />
+                                    <GridLevelCell
+                                      test={t}
+                                      lvl="L3"
+                                      initialValue={v3}
+                                      isAiFilled={Boolean(aiFlags.L3)}
+                                      inputRefCallback={(el) =>
+                                        (inputRefs.current[`grid-L3-${idx}`] =
+                                          el)
+                                      }
+                                      onNavigateRow={(delta) => {
+                                        const nextEl =
+                                          inputRefs.current[
+                                            `grid-L3-${idx + delta}`
+                                          ];
+                                        if (nextEl) {
+                                          nextEl.focus();
+                                          nextEl.select();
+                                        }
+                                      }}
+                                      onCommitValue={handleCommitGridValue}
+                                    />
+                                  </tr>
+                                );
+                              }
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      (() => {
+                        const testsInCtrl = getTestsForControl(
+                          selMachine,
+                          selControl
+                        );
+                        const maxLv = Math.max(
+                          1,
+                          ...testsInCtrl.map((t) => t.levels_count || 2)
+                        ) as 1 | 2 | 3;
+                        const levelList: ("L1" | "L2" | "L3")[] =
+                          maxLv === 3
+                            ? ["L1", "L2", "L3"]
+                            : maxLv === 2
+                            ? ["L1", "L2"]
+                            : ["L1"];
+                        return (
+                          <div
+                            className={`grid grid-cols-1 ${
+                              maxLv === 3
+                                ? "md:grid-cols-3"
+                                : maxLv === 2
+                                ? "md:grid-cols-2"
+                                : "md:grid-cols-1"
+                            } gap-4 max-w-4xl mx-auto`}
+                          >
+                            {levelList.map((lvl) => {
+                              const saved = isLevelSaved(
+                                selMachine,
+                                selControl,
+                                lvl
+                              );
+                              return (
+                                <button
+                                  key={lvl}
+                                  onClick={() => {
+                                    setSelLevel(lvl);
+                                    if (saved) {
+                                      setWarningModal({
+                                        open: true,
+                                        type: "LEVEL",
+                                        machine: selMachine,
+                                        control: selControl,
+                                        level: lvl,
+                                      });
+                                      setSearchQuery("");
+                                      setEditDrafts({});
+                                      return;
+                                    }
+                                    const initTemp: Record<string, string> = {};
+                                    testsInCtrl.forEach((t) => {
+                                      initTemp[t.test_id] =
+                                        savedValues[t.test_id]?.[lvl] ??
+                                        (t.test_type === "QUALITATIVE"
+                                          ? lvl === "L1"
+                                            ? t.expected_qual_L1 || "ÂM TÍNH"
+                                            : lvl === "L2"
+                                            ? t.expected_qual_L2 || "DƯƠNG TÍNH"
+                                            : t.expected_qual_L3 || "DƯƠNG TÍNH"
+                                          : "");
+                                    });
+                                    setTempInputs(initTemp);
+                                    setStep("ENTER_RESULTS");
+                                  }}
+                                  className={`rounded-2xl p-5 text-left border-2 border-b-[5px] transition-all hover:-translate-y-0.5 ${
+                                    saved
+                                      ? "bg-gradient-to-b from-emerald-500 to-emerald-600 border-emerald-700 text-white shadow-lg"
+                                      : "bg-gradient-to-b from-sky-500 to-blue-600 border-blue-800 text-white shadow-lg"
+                                  }`}
+                                >
+                                  <div className="flex items-center justify-between mb-2">
+                                    <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold uppercase bg-black/20">
+                                      {lvl === "L1"
+                                        ? "Mức 1"
+                                        : lvl === "L2"
+                                        ? "Mức 2"
+                                        : "Mức 3"}
+                                    </span>
+                                    {saved && <Ic.Check />}
+                                  </div>
+                                  <div className="text-xl font-black">
+                                    {lvl === "L1"
+                                      ? "MỨC 1 (LEVEL 1)"
+                                      : lvl === "L2"
+                                      ? "MỨC 2 (LEVEL 2)"
+                                      : "MỨC 3 (LEVEL 3)"}
+                                  </div>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        );
+                      })()
+                    )}
+                  </div>
+                </div>
 
                 <div className="pt-4 border-t border-slate-200 flex flex-col items-center">
                   <div className="text-xs font-bold text-slate-600 mb-3">
@@ -3339,7 +4239,16 @@ export default function App() {
                           setConfigs,
                           setReagents,
                           setBm09Logs,
-                          setWestgardReport
+                          setWestgardReport,
+                          (offlineBatch) =>
+                            setPendingSyncQueue((prev) => [
+                              ...prev,
+                              offlineBatch,
+                            ]),
+                          () => {
+                            setAiFilledMap({});
+                            setCurrentMachineDraft(null);
+                          }
                         )
                       }
                       className="px-6 py-3 rounded-xl font-black text-xs uppercase bg-gradient-to-r from-blue-600 to-indigo-600 text-white border-b-4 border-indigo-900 shadow-md transition"
@@ -3367,7 +4276,16 @@ export default function App() {
                           setConfigs,
                           setReagents,
                           setBm09Logs,
-                          setWestgardReport
+                          setWestgardReport,
+                          (offlineBatch) =>
+                            setPendingSyncQueue((prev) => [
+                              ...prev,
+                              offlineBatch,
+                            ]),
+                          () => {
+                            setAiFilledMap({});
+                            setCurrentMachineDraft(null);
+                          }
                         )
                       }
                       className="px-6 py-3 rounded-xl font-black text-xs uppercase bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white border-b-4 border-purple-900 shadow-md transition"
@@ -3600,7 +4518,7 @@ export default function App() {
 
             {step === "ENTER_RESULTS" && selMachine && selControl && (
               <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
-                <div className="flex items-center justify-between mb-5 pb-3 border-b border-slate-200">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-5 pb-3 border-b border-slate-200">
                   <div>
                     <span className="px-3 py-1 rounded-full text-xs font-extrabold bg-blue-600 text-white">
                       Đang nhập{" "}
@@ -3614,12 +4532,32 @@ export default function App() {
                       {selMachine} — {selControl}
                     </h2>
                   </div>
-                  <button
-                    onClick={() => setStep("SELECT_LEVEL")}
-                    className="flex items-center gap-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-xl"
-                  >
-                    <Ic.Back /> Quay lại chọn Mức
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={isScanningImage}
+                      onClick={() => cameraInputRef.current?.click()}
+                      className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-black shadow-sm"
+                    >
+                      {isScanningImage
+                        ? "⏳ Đang quét AI..."
+                        : `📸 Quét Ảnh ${selLevel} (AI)`}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isScanningImage}
+                      onClick={() => galleryInputRef.current?.click()}
+                      className="px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold"
+                    >
+                      🖼️ Chọn Ảnh
+                    </button>
+                    <button
+                      onClick={() => setStep("SELECT_LEVEL")}
+                      className="flex items-center gap-1.5 text-xs font-bold text-slate-700 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-xl"
+                    >
+                      <Ic.Back /> Quay lại chọn Mức
+                    </button>
+                  </div>
                 </div>
                 <div className="space-y-3 max-w-4xl mx-auto">
                   {getTestsForControl(selMachine, selControl).map((t, idx) => {
@@ -3645,7 +4583,8 @@ export default function App() {
                         ? t.expected_qual_L2 || "DƯƠNG TÍNH"
                         : t.expected_qual_L3 || "DƯƠNG TÍNH";
                     const val = tempInputs[t.test_id] ?? "";
-                    const num = val !== "" ? parseFloat(val) : null;
+                    const cleanVal = val.trim().replace(/,/g, ".");
+                    const num = cleanVal !== "" ? parseFloat(cleanVal) : null;
                     const z =
                       t.test_type !== "QUALITATIVE" &&
                       num !== null &&
@@ -3656,6 +4595,9 @@ export default function App() {
                     const sdBadge =
                       z !== null ? formatSDPositionBadge(z) : null;
                     const isLabRange = t.range_source !== "MANUFACTURER";
+                    const isAiCell = Boolean(
+                      aiFilledMap[t.test_id]?.[selLevel]
+                    );
                     return (
                       <div
                         key={t.test_id}
@@ -3687,6 +4629,11 @@ export default function App() {
                               >
                                 {isLabRange ? "Range Phòng" : "Range Hãng"}
                               </span>
+                              {isAiCell && (
+                                <span className="px-2 py-0.5 rounded-full bg-amber-300 text-amber-950 font-black text-[10px]">
+                                  ✨ AI Quét
+                                </span>
+                              )}
                             </div>
                             {t.test_type !== "QUALITATIVE" ? (
                               <div className="flex items-center gap-2 mt-1">
@@ -3720,12 +4667,16 @@ export default function App() {
                                 ref={(el) =>
                                   (inputRefs.current[`entry-${idx}`] = el)
                                 }
-                                type="number"
-                                step="any"
+                                type="text"
+                                inputMode="decimal"
+                                onWheel={(e) => e.currentTarget.blur()}
                                 value={val}
                                 placeholder="Nhập số..."
                                 onChange={(e) => {
-                                  const nextVal = e.target.value;
+                                  const nextVal = e.target.value.replace(
+                                    /,/g,
+                                    "."
+                                  );
                                   setTempInputs((prev) => ({
                                     ...prev,
                                     [t.test_id]: nextVal,
@@ -3742,7 +4693,11 @@ export default function App() {
                                     }
                                   }
                                 }}
-                                className="w-36 bg-white border-2 border-slate-300 focus:border-blue-600 text-slate-900 font-mono font-black text-base text-right px-3.5 py-2 rounded-xl shadow-inner outline-none"
+                                className={`w-36 bg-white border-2 text-slate-900 font-mono font-black text-base text-right px-3.5 py-2 rounded-xl shadow-inner outline-none ${
+                                  isAiCell
+                                    ? "border-amber-500 ring-2 ring-amber-400/70 bg-amber-50/40"
+                                    : "border-slate-300 focus:border-blue-600"
+                                }`}
                               />
                             </>
                           ) : (
@@ -3773,7 +4728,9 @@ export default function App() {
                       setSavedValues((prev) => {
                         const next = { ...prev };
                         tests.forEach((t) => {
-                          const raw = tempInputs[t.test_id]?.trim() || "";
+                          const raw =
+                            tempInputs[t.test_id]?.trim().replace(/,/g, ".") ||
+                            "";
                           next[t.test_id] = {
                             ...(next[t.test_id] || {}),
                             [selLevel]: raw,
@@ -4244,6 +5201,8 @@ export default function App() {
                               if (!ok) return;
                               const targetPt = selectedPointInfo.point;
                               const targetId = selectedPointInfo.testId;
+                              const targetLv = selectedPointInfo.levelKey;
+
                               setConfigs((prev) =>
                                 prev.map((c) =>
                                   c.test_id === targetId
@@ -4253,42 +5212,114 @@ export default function App() {
                                           0,
                                           c.accumulated_points - 1
                                         ),
-                                        history_L1: c.history_L1.filter(
-                                          (h) =>
-                                            !(
-                                              h.isoDate === targetPt.isoDate &&
-                                              h.val === targetPt.val &&
-                                              Boolean(h.is_rerun) ===
-                                                Boolean(targetPt.is_rerun)
-                                            )
-                                        ),
-                                        history_L2: c.history_L2.filter(
-                                          (h) =>
-                                            !(
-                                              h.isoDate === targetPt.isoDate &&
-                                              h.val === targetPt.val &&
-                                              Boolean(h.is_rerun) ===
-                                                Boolean(targetPt.is_rerun)
-                                            )
-                                        ),
-                                        history_L3: (c.history_L3 || []).filter(
-                                          (h) =>
-                                            !(
-                                              h.isoDate === targetPt.isoDate &&
-                                              h.val === targetPt.val &&
-                                              Boolean(h.is_rerun) ===
-                                                Boolean(targetPt.is_rerun)
-                                            )
-                                        ),
+                                        history_L1:
+                                          targetLv === "L1"
+                                            ? c.history_L1.filter(
+                                                (h) =>
+                                                  !(
+                                                    h.isoDate ===
+                                                      targetPt.isoDate &&
+                                                    h.val === targetPt.val &&
+                                                    Boolean(h.is_rerun) ===
+                                                      Boolean(targetPt.is_rerun)
+                                                  )
+                                              )
+                                            : c.history_L1,
+                                        history_L2:
+                                          targetLv === "L2"
+                                            ? c.history_L2.filter(
+                                                (h) =>
+                                                  !(
+                                                    h.isoDate ===
+                                                      targetPt.isoDate &&
+                                                    h.val === targetPt.val &&
+                                                    Boolean(h.is_rerun) ===
+                                                      Boolean(targetPt.is_rerun)
+                                                  )
+                                              )
+                                            : c.history_L2,
+                                        history_L3:
+                                          targetLv === "L3"
+                                            ? (c.history_L3 || []).filter(
+                                                (h) =>
+                                                  !(
+                                                    h.isoDate ===
+                                                      targetPt.isoDate &&
+                                                    h.val === targetPt.val &&
+                                                    Boolean(h.is_rerun) ===
+                                                      Boolean(targetPt.is_rerun)
+                                                  )
+                                              )
+                                            : c.history_L3 || [],
                                       }
                                     : c
                                 )
                               );
+
+                              // HM 20: Đồng bộ xóa/dọn trong Sổ BM.09
+                              setBm09Logs((prev) => {
+                                const next: BM09LogEntry[] = [];
+                                for (const log of prev) {
+                                  if (
+                                    log.test_id !== targetId ||
+                                    log.run_date !== targetPt.isoDate
+                                  ) {
+                                    next.push(log);
+                                    continue;
+                                  }
+                                  if (targetPt.is_rerun) {
+                                    const clone = { ...log };
+                                    delete clone.rerun_val;
+                                    delete clone.rerun_level;
+                                    next.push(clone);
+                                  } else {
+                                    const clone = { ...log };
+                                    if (
+                                      targetLv === "L1" &&
+                                      Number(clone.val_L1) ===
+                                        Number(targetPt.val)
+                                    ) {
+                                      clone.val_L1 = null;
+                                      clone.z_L1 = null;
+                                    }
+                                    if (
+                                      targetLv === "L2" &&
+                                      Number(clone.val_L2) ===
+                                        Number(targetPt.val)
+                                    ) {
+                                      clone.val_L2 = null;
+                                      clone.z_L2 = null;
+                                    }
+                                    if (
+                                      targetLv === "L3" &&
+                                      Number(clone.val_L3) ===
+                                        Number(targetPt.val)
+                                    ) {
+                                      clone.val_L3 = null;
+                                      clone.z_L3 = null;
+                                    }
+                                    const allEmpty =
+                                      clone.val_L1 === null &&
+                                      clone.val_L2 === null &&
+                                      (clone.val_L3 === null ||
+                                        clone.val_L3 === undefined);
+                                    if (!allEmpty) next.push(clone);
+                                  }
+                                }
+                                return next;
+                              });
+
                               setSelectedPointInfo(null);
                               await rpcCall(
                                 apiUrl,
                                 "admin_void_point",
-                                { test_id: targetId, date: targetPt.isoDate },
+                                {
+                                  test_id: targetId,
+                                  date: targetPt.isoDate,
+                                  val: targetPt.val,
+                                  is_rerun: Boolean(targetPt.is_rerun),
+                                  level: targetLv,
+                                },
                                 authToken
                               );
                             }}
@@ -4353,7 +5384,7 @@ export default function App() {
         )}
 
         {/* ------------------------------------------------------------------- */}
-        {/* 6. TAB QUẢN LÝ ADMIN (GỒM CẢ CỬA SỔ 2 CỘT CÁC TEST NGOẠI LỆ)         */}
+        {/* 6. TAB QUẢN LÝ ADMIN (GỒM CẢ CỬA SỔ 2 CỘT CÁC TEST NGOẠI LỆ & AI)    */}
         {/* ------------------------------------------------------------------- */}
         {activeTab === "ACCOUNTS" && canAccessAdminPanel && (
           <AdminPanel
@@ -4371,6 +5402,9 @@ export default function App() {
             setConfigs={setConfigs}
             setReagents={setReagents}
             setBm09Logs={setBm09Logs}
+            aiConfig={aiConfig}
+            setAiConfig={setAiConfig}
+            currentUser={currentUser}
           />
         )}
       </main>
@@ -4535,15 +5569,16 @@ export default function App() {
                           )}
                         </div>
                         <input
-                          type="number"
-                          step="any"
+                          type="text"
+                          inputMode="decimal"
+                          onWheel={(e) => e.currentTarget.blur()}
                           value={correctiveModal.reRunInputs[lv]}
                           onChange={(e) =>
                             setCorrectiveModal({
                               ...correctiveModal,
                               reRunInputs: {
                                 ...correctiveModal.reRunInputs,
-                                [lv]: e.target.value,
+                                [lv]: e.target.value.replace(/,/g, "."),
                               },
                             })
                           }
@@ -4756,11 +5791,12 @@ export default function App() {
                         </span>
                         <input
                           type="text"
+                          inputMode="decimal"
                           value={draftVal}
                           onChange={(e) =>
                             setEditDrafts((prev) => ({
                               ...prev,
-                              [t.test_id]: e.target.value,
+                              [t.test_id]: e.target.value.replace(/,/g, "."),
                             }))
                           }
                           placeholder="Giá trị mới..."
@@ -4784,7 +5820,7 @@ export default function App() {
                   setSavedValues((prev) => {
                     const next = { ...prev };
                     Object.entries(editDrafts).forEach(([testId, newVal]) => {
-                      const trimmed = newVal.trim();
+                      const trimmed = newVal.trim().replace(/,/g, ".");
                       if (trimmed !== "") {
                         next[testId] = {
                           ...(next[testId] || {}),
@@ -4810,6 +5846,50 @@ export default function App() {
               >
                 Lưu cập nhật
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL HIỂN THỊ MÃ QR ĐỂ MỞ APP TRÊN ĐIỆN THOẠI */}
+      {showMobileQrModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white border-2 border-indigo-200 rounded-3xl max-w-sm w-full p-6 shadow-2xl text-center space-y-4">
+            <div className="flex items-center justify-between">
+              <span className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase bg-indigo-100 text-indigo-800">
+                📱 Liên thông Điện thoại ↔ PC
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowMobileQrModal(false)}
+                className="text-xs font-bold text-slate-400 hover:text-slate-700"
+              >
+                ✕ Đóng
+              </button>
+            </div>
+
+            <h3 className="text-base font-black text-slate-900">
+              Quét Mã QR Để Mở Trên Điện Thoại
+            </h3>
+            <p className="text-xs text-slate-500">
+              Dùng Camera trên điện thoại quét mã QR bên dưới để mở thẳng ứng
+              dụng tại máy xét nghiệm:
+            </p>
+
+            <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200 inline-block">
+              <img
+                src={`https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(
+                  typeof window !== "undefined"
+                    ? window.location.origin
+                    : "https://vercel.com"
+                )}`}
+                alt="Mobile QR Code"
+                className="w-48 h-48 mx-auto rounded-lg"
+              />
+            </div>
+
+            <div className="text-[11px] font-mono bg-slate-100 p-2 rounded-xl text-slate-600 break-all">
+              {typeof window !== "undefined" ? window.location.origin : ""}
             </div>
           </div>
         </div>
